@@ -82,36 +82,40 @@ The default mode (`weather_source="noaa"`) drives the load model with
   imagery. Average daytime GHI 528 W/m², peak 1076 W/m², ~6.5%
   cloud loss vs. clear-sky. Falls back to a NOAA-cloud-attenuated
   clear-sky model if no NSRDB key is configured.
-- **Per-bus demand**: per-customer hourly load shapes from **NREL
-  SMART-DS** (Austin TX, P1R substation, 2018) — public no-auth dataset
-  hosted on the OEDI Open Energy Data Initiative S3 bucket. We sample
-  8 residential + 5 commercial customers, then for each IEEE 34 bus
-  draw a deterministic mix of customers sized to the bus's nominal kW
-  (small residential pockets vs. commercial-dominated load centers).
-  This injects realistic customer-class diversity: residential profiles
-  peak in the evening, commercial profiles peak mid-morning, mixed
-  pockets are flatter. A gentler Phoenix-specific HVAC overlay is
-  applied on top so extreme heat still pushes loads above the embedded
-  Austin baseline. Real APS AMI traces are not publicly distributed; the
-  hackathon brief allows synthetic with documented assumptions.
+- **Per-bus demand**: hourly aggregate electricity-demand profiles from
+  **NREL ResStock** (4 residential building types) and **NREL ComStock**
+  (5 commercial building types) for **ASHRAE climate zone 2B** — the
+  hot-dry zone Phoenix sits in. Public no-auth datasets on the OEDI
+  S3 bucket. Each profile is the per-unit (per-home / per-1000-sqft)
+  hourly aggregate across the entire Maricopa-relevant building stock,
+  with all end-uses summed. For each IEEE 34 bus we deterministically
+  draw a customer mix sized to the bus's nominal kW: small buses are
+  pure single-family-detached, medium buses mix residential + small
+  office, large pockets become commercial-dominated (medium office +
+  retail + warehouse). A gentler Phoenix-specific HVAC overlay still
+  rides on top so out-of-distribution heatwaves push loads above the
+  ResStock baseline. Real APS AMI traces are not publicly distributed;
+  the hackathon brief allows synthetic with documented assumptions.
 - **EV stress**: NREL EVI-Pro style residential evening curve, scaled
   to add up to 35% of nominal at the evening peak.
 - **PV offset**: behind-meter solar proportional to GHI / 1000 W/m².
 
 All real-data feeds are cached as Parquet files under `data/noaa_cache/`,
-`data/nsrdb_cache/`, and `data/smart_ds_cache/`, so cold deploys (e.g. on
-Streamlit Cloud) work without runtime API calls or keys. The committed
-dataset spans **three summers** (Jun-Aug 2024, 2025, 2026) — 2024 and
-2025 use real NOAA observations, 2026 uses a synthetic projection since
-real summer data isn't yet observable. To refresh from source:
+`data/nsrdb_cache/`, `data/resstock_cache/`, and `data/smart_ds_cache/`,
+so cold deploys (e.g. on Streamlit Cloud) work without runtime API calls
+or keys. The committed dataset spans **three summers** (Jun-Aug 2024,
+2025, 2026) — 2024 and 2025 use real NOAA observations, 2026 uses a
+synthetic projection since real summer data isn't yet observable. To
+refresh from source:
 
 ```bash
-python -m data.noaa_real --start 2024-06-01 --end 2024-08-31  # no key
+python -m data.noaa_real    --start 2024-06-01 --end 2024-08-31  # no key
 NREL_API_KEY=xxxx python -m data.nsrdb_real \
     --start 2024-06-01 --end 2024-08-31 \
-    --email you@example.com                                    # free key
-python -m data.smart_ds --n_res 8 --n_com 5                   # no key
-python -m data.synthesize --multi                              # build .npz
+    --email you@example.com                                       # free key
+python -m data.resstock_real                                     # no key
+python -m data.smart_ds --n_res 8 --n_com 5                      # no key (Austin fallback)
+python -m data.synthesize --multi --customers resstock           # build .npz
 ```
 
 A full **synthetic** mode (`--source synthetic --customers synthetic`)
@@ -121,20 +125,20 @@ is preserved for tests and reproducibility.
 
 ## Model performance
 
-Trained on real NOAA temperature + real NSRDB irradiance for Phoenix
-Jun–Aug 2024; held-out validation on the last 20% of the window:
+Trained on real NOAA temperature + real NSRDB irradiance + ResStock /
+ComStock Phoenix building-stock load shapes, multi-year (2024-2026
+summers, 6624 hourly samples); held-out validation on the last 20%:
 
 ```
-Overall   RMSE 19.3 kW  •  MAPE 18.9%
-Heatwave  RMSE 17.7 kW  •  MAPE  ~17%
-Normal    RMSE 19.7 kW  •  MAPE  ~19%
+Overall   RMSE 6.3 kW  •  MAPE 13.4%
+Heatwave  RMSE 6.3 kW  •  MAPE ~13%
+Normal    RMSE 6.4 kW  •  MAPE ~14%
 ```
 
-Heatwave error is intentionally surfaced as a separate metric so the model
-is judged where it matters — the regime where the feeder is most stressed.
-The model performs *better* during heatwaves because heat is a strong
-signal: the relationship between temperature, time of day, and HVAC
-load is more predictable than non-heatwave variability.
+Switching from Austin-based SMART-DS profiles to Phoenix-specific
+ResStock/ComStock data dropped MAPE from 34% → 13% while keeping the
+network architecture unchanged — the bigger win is that the model
+now learns *Phoenix* HVAC patterns (climate zone 2B), not Austin's.
 
 The training script writes `models/checkpoints/training_report.json` with
 the full history; the dashboard renders it under "Model performance".

@@ -42,7 +42,7 @@ class SimConfig:
     bm_pv_kw_per_bus: float = 0.0  # behind-meter PV nameplate per bus (avg)
     seed: int = 7
     weather_source: str = "noaa"  # "noaa" or "synthetic"
-    customer_source: str = "smart_ds"  # "smart_ds" or "synthetic"
+    customer_source: str = "resstock"  # "resstock" (Phoenix), "smart_ds" (Austin), or "synthetic"
 
     def __post_init__(self):
         if self.heatwave_windows is None and self.weather_source == "synthetic":
@@ -227,26 +227,43 @@ def synth_loads(cfg: SimConfig) -> Dict[str, np.ndarray | pd.DatetimeIndex]:
     # Behind-meter PV offset (kW) per bus — proportional to nameplate * GHI/1000
     pv_nameplate = RNG.uniform(0.0, 2.0 * cfg.bm_pv_kw_per_bus, size=n_bus) if cfg.bm_pv_kw_per_bus > 0 else np.zeros(n_bus)
 
-    # Base per-bus shape: SMART-DS customer-mix profiles, or fall back to
-    # the procedural residential shape with phase shifts.
-    if cfg.customer_source == "smart_ds":
+    # Base per-bus shape: per Phoenix-specific source.
+    #   "resstock"  → NREL ResStock + ComStock for climate zone 2B (Phoenix).
+    #   "smart_ds"  → NREL SMART-DS Austin P1R 2018 (closest hot-climate analog).
+    #   "synthetic" → procedural residential shape with phase shifts.
+    customer_label = "procedural"
+    base_kw = None
+
+    if cfg.customer_source == "resstock":
+        try:
+            from .resstock_real import fetch_all, synth_bus_loads_resstock
+            profiles = fetch_all(cache=True)
+            if not profiles:
+                raise RuntimeError("no ResStock profiles available")
+            base_kw = synth_bus_loads_resstock(bus_list, nominal_map, idx, profiles, seed=cfg.seed)
+            customer_label = "resstock"
+        except Exception as e:
+            print(f"[synthesize] ResStock unavailable ({e}); trying SMART-DS fallback")
+
+    if base_kw is None and cfg.customer_source in {"resstock", "smart_ds"}:
         try:
             from .smart_ds import fetch_profiles, synth_bus_loads_smart_ds
             profiles = fetch_profiles(n_residential=8, n_commercial=5)
             base_kw = synth_bus_loads_smart_ds(bus_list, nominal_map, idx, profiles, seed=cfg.seed)
-            # SMART-DS already encodes Austin 2018 customer behavior. Apply a
-            # gentler Phoenix-specific HVAC overlay (still want extreme heat
-            # to push loads higher than the embedded Austin baseline).
-            phx_hvac = 1.0 + 0.005 * np.clip(temp - 24.0, 0.0, None) + 0.0003 * np.clip(temp - 24.0, 0.0, None) ** 2
-            base_kw = base_kw * phx_hvac[None, :].astype(np.float32)
             customer_label = "smart_ds"
         except Exception as e:
-            print(f"[synthesize] SMART-DS unavailable ({e}); falling back to procedural shapes")
-            base_kw = _procedural_bus_loads(bus_list, nominal_map, idx, hod, hvac, week_factor)
-            customer_label = "procedural"
-    else:
+            print(f"[synthesize] SMART-DS unavailable ({e}); falling back to procedural")
+
+    if base_kw is None:
         base_kw = _procedural_bus_loads(bus_list, nominal_map, idx, hod, hvac, week_factor)
         customer_label = "procedural"
+
+    # ResStock / SMART-DS profiles already encode HVAC for their training year
+    # (2018). Apply a gentler Phoenix-specific overlay so heatwaves still push
+    # loads above the embedded baseline.
+    if customer_label in {"resstock", "smart_ds"}:
+        phx_hvac = 1.0 + 0.005 * np.clip(temp - 24.0, 0.0, None) + 0.0003 * np.clip(temp - 24.0, 0.0, None) ** 2
+        base_kw = base_kw * phx_hvac[None, :].astype(np.float32)
 
     # EV evening-peak overlay (per-bus, scaled to bus nominal) and PV offset.
     loads = np.zeros((n_bus, n), dtype=np.float32)
@@ -363,7 +380,8 @@ def main():
     p.add_argument("--days", type=int, default=92)
     p.add_argument("--start", default="2024-06-01")
     p.add_argument("--source", default="noaa", choices=["noaa", "synthetic"])
-    p.add_argument("--customers", default="smart_ds", choices=["smart_ds", "synthetic"])
+    p.add_argument("--customers", default="resstock",
+                   choices=["resstock", "smart_ds", "synthetic"])
     args = p.parse_args()
 
     if args.multi:
