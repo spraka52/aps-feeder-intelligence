@@ -45,11 +45,13 @@ class Forecaster:
     def forecast_window(self, ds: FeederWindowDataset, t0: int) -> np.ndarray:
         """Run a forecast where input window starts at index t0.
 
-        Returns array shape [horizon_out, N] of predicted load_kw.
+        Returns array shape [horizon_out, N] of predicted load_kw. Output is
+        clipped to ≥ 0 since negative load is non-physical (the model occasionally
+        outputs tiny negatives — within numerical noise — for buses near zero).
         """
         N = len(self.bus_order)
         Xs = np.stack([ds._features_at(t0 + k, N) for k in range(self.horizon_in)], axis=0)
         X = torch.from_numpy(Xs[None, ...])  # [1, T, N, F]
         with torch.no_grad():
             yhat = self.model(X, self.edge_index).numpy()[0]  # [T_out, N]
-        return yhat
+        return np.clip(yhat, 0.0, None)
