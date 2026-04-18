@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+.ipynb_checkpoints/
+*.log
+# Local-only screenshot captures from scripts/capture_*.py
+reports/panels/
+reports/dashboard_*.png
+reports/cache/

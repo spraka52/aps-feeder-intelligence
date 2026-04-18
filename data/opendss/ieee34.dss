@@ -1,0 +1,69 @@
+Clear
+New Circuit.IEEE34 basekv=69.0 pu=1.03 phases=3 bus1=sourcebus
+New Transformer.Sub Phases=3 Windings=2 Xhl=8 wdg=1 bus=sourcebus conn=delta kv=69 kva=2500 %r=1 wdg=2 bus=800 conn=wye kv=24.9 kva=2500 %r=1
+New Linecode.LC_300 nphases=3 R1=0.253 X1=0.252 C1=0 R0=0.253 X0=0.252 C0=0 Units=mi normamps=530
+New Linecode.LC_301 nphases=3 R1=0.366 X1=0.267 C1=0 R0=0.366 X0=0.267 C0=0 Units=mi normamps=230
+New Linecode.LC_302 nphases=3 R1=0.530 X1=0.281 C1=0 R0=0.530 X0=0.281 C0=0 Units=mi normamps=230
+New Linecode.LC_303 nphases=3 R1=0.530 X1=0.281 C1=0 R0=0.530 X0=0.281 C0=0 Units=mi normamps=230
+New Linecode.LC_304 nphases=3 R1=0.364 X1=0.269 C1=0 R0=0.364 X0=0.269 C0=0 Units=mi normamps=230
+New Line.L_800_802 Bus1=800 Bus2=802 LineCode=LC_300 Length=0.4886 Units=mi
+New Line.L_802_806 Bus1=802 Bus2=806 LineCode=LC_300 Length=0.3277 Units=mi
+New Line.L_806_808 Bus1=806 Bus2=808 LineCode=LC_300 Length=6.1042 Units=mi
+New Line.L_808_810 Bus1=808 Bus2=810 LineCode=LC_303 Length=1.0992 Units=mi
+New Line.L_808_812 Bus1=808 Bus2=812 LineCode=LC_300 Length=7.1023 Units=mi
+New Line.L_812_814 Bus1=812 Bus2=814 LineCode=LC_300 Length=5.6307 Units=mi
+New Line.L_814_850 Bus1=814R Bus2=850 LineCode=LC_301 Length=0.0019 Units=mi
+New Line.L_850_816 Bus1=850 Bus2=816 LineCode=LC_301 Length=0.0587 Units=mi
+New Line.L_816_818 Bus1=816 Bus2=818 LineCode=LC_302 Length=0.3239 Units=mi
+New Line.L_816_824 Bus1=816 Bus2=824 LineCode=LC_301 Length=1.9337 Units=mi
+New Line.L_818_820 Bus1=818 Bus2=820 LineCode=LC_302 Length=9.1193 Units=mi
+New Line.L_820_822 Bus1=820 Bus2=822 LineCode=LC_302 Length=2.6023 Units=mi
+New Line.L_824_826 Bus1=824 Bus2=826 LineCode=LC_303 Length=0.5739 Units=mi
+New Line.L_824_828 Bus1=824 Bus2=828 LineCode=LC_301 Length=0.1591 Units=mi
+New Line.L_828_830 Bus1=828 Bus2=830 LineCode=LC_301 Length=3.8712 Units=mi
+New Line.L_830_854 Bus1=830 Bus2=854 LineCode=LC_301 Length=0.0985 Units=mi
+New Line.L_854_852 Bus1=854 Bus2=852 LineCode=LC_301 Length=6.9754 Units=mi
+New Line.L_852_832 Bus1=852R Bus2=832 LineCode=LC_301 Length=0.0019 Units=mi
+New Line.L_832_858 Bus1=832 Bus2=858 LineCode=LC_301 Length=0.9280 Units=mi
+New Transformer.XFM_832_888 Phases=3 Windings=2 Xhl=4.08 wdg=1 bus=832 conn=wye kv=24.9 kva=500 %r=0.95 wdg=2 bus=888 conn=wye kv=4.16 kva=500 %r=0.95
+New Line.L_858_864 Bus1=858 Bus2=864 LineCode=LC_302 Length=0.3068 Units=mi
+New Line.L_858_834 Bus1=858 Bus2=834 LineCode=LC_301 Length=1.1042 Units=mi
+New Line.L_834_860 Bus1=834 Bus2=860 LineCode=LC_301 Length=0.3826 Units=mi
+New Line.L_834_842 Bus1=834 Bus2=842 LineCode=LC_301 Length=0.0530 Units=mi
+New Line.L_836_840 Bus1=836 Bus2=840 LineCode=LC_301 Length=0.1629 Units=mi
+New Line.L_836_862 Bus1=836 Bus2=862 LineCode=LC_304 Length=0.0530 Units=mi
+New Line.L_862_838 Bus1=862 Bus2=838 LineCode=LC_304 Length=0.9280 Units=mi
+New Line.L_842_844 Bus1=842 Bus2=844 LineCode=LC_301 Length=0.2557 Units=mi
+New Line.L_844_846 Bus1=844 Bus2=846 LineCode=LC_301 Length=0.6894 Units=mi
+New Line.L_846_848 Bus1=846 Bus2=848 LineCode=LC_301 Length=0.1004 Units=mi
+New Line.L_860_836 Bus1=860 Bus2=836 LineCode=LC_301 Length=0.5076 Units=mi
+New Line.L_888_890 Bus1=888 Bus2=890 LineCode=LC_300 Length=2.0000 Units=mi
+New Line.L_854_856 Bus1=854 Bus2=856 LineCode=LC_303 Length=4.4186 Units=mi
+New Load.LD_806 Bus1=806 Phases=3 Conn=wye Model=1 kV=24.9 kW=30.000 kvar=14.530 Vminpu=0.85 Vmaxpu=1.20
+New Load.LD_810 Bus1=810 Phases=3 Conn=wye Model=1 kV=24.9 kW=16.000 kvar=7.749 Vminpu=0.85 Vmaxpu=1.20
+New Load.LD_820 Bus1=820 Phases=3 Conn=wye Model=1 kV=24.9 kW=135.000 kvar=65.383 Vminpu=0.85 Vmaxpu=1.20
+New Load.LD_822 Bus1=822 Phases=3 Conn=wye Model=1 kV=24.9 kW=21.000 kvar=10.171 Vminpu=0.85 Vmaxpu=1.20
+New Load.LD_824 Bus1=824 Phases=3 Conn=wye Model=1 kV=24.9 kW=5.000 kvar=2.422 Vminpu=0.85 Vmaxpu=1.20
+New Load.LD_826 Bus1=826 Phases=3 Conn=wye Model=1 kV=24.9 kW=40.000 kvar=19.373 Vminpu=0.85 Vmaxpu=1.20
+New Load.LD_828 Bus1=828 Phases=3 Conn=wye Model=1 kV=24.9 kW=7.000 kvar=3.390 Vminpu=0.85 Vmaxpu=1.20
+New Load.LD_830 Bus1=830 Phases=3 Conn=wye Model=1 kV=24.9 kW=27.000 kvar=13.077 Vminpu=0.85 Vmaxpu=1.20
+New Load.LD_856 Bus1=856 Phases=3 Conn=wye Model=1 kV=24.9 kW=4.000 kvar=1.937 Vminpu=0.85 Vmaxpu=1.20
+New Load.LD_858 Bus1=858 Phases=3 Conn=wye Model=1 kV=24.9 kW=9.000 kvar=4.359 Vminpu=0.85 Vmaxpu=1.20
+New Load.LD_864 Bus1=864 Phases=3 Conn=wye Model=1 kV=24.9 kW=2.000 kvar=0.969 Vminpu=0.85 Vmaxpu=1.20
+New Load.LD_834 Bus1=834 Phases=3 Conn=wye Model=1 kV=24.9 kW=16.000 kvar=7.749 Vminpu=0.85 Vmaxpu=1.20
+New Load.LD_860 Bus1=860 Phases=3 Conn=wye Model=1 kV=24.9 kW=23.000 kvar=11.139 Vminpu=0.85 Vmaxpu=1.20
+New Load.LD_836 Bus1=836 Phases=3 Conn=wye Model=1 kV=24.9 kW=27.000 kvar=13.077 Vminpu=0.85 Vmaxpu=1.20
+New Load.LD_840 Bus1=840 Phases=3 Conn=wye Model=1 kV=24.9 kW=27.000 kvar=13.077 Vminpu=0.85 Vmaxpu=1.20
+New Load.LD_862 Bus1=862 Phases=3 Conn=wye Model=1 kV=24.9 kW=28.000 kvar=13.561 Vminpu=0.85 Vmaxpu=1.20
+New Load.LD_844 Bus1=844 Phases=3 Conn=wye Model=1 kV=24.9 kW=432.000 kvar=209.227 Vminpu=0.85 Vmaxpu=1.20
+New Load.LD_846 Bus1=846 Phases=3 Conn=wye Model=1 kV=24.9 kW=25.000 kvar=12.108 Vminpu=0.85 Vmaxpu=1.20
+New Load.LD_848 Bus1=848 Phases=3 Conn=wye Model=1 kV=24.9 kW=60.000 kvar=29.059 Vminpu=0.85 Vmaxpu=1.20
+New Load.LD_890 Bus1=890 Phases=3 Conn=wye Model=1 kV=4.16 kW=450.000 kvar=217.945 Vminpu=0.85 Vmaxpu=1.20
+New Transformer.Reg1 phases=3 windings=2 buses=(814 814R) conns=(wye wye) kvs=(24.9 24.9) kvas=(2500 2500) XHL=0.01 %loadloss=0.01
+New RegControl.Reg1 transformer=Reg1 winding=2 vreg=125 band=2 ptratio=120
+New Transformer.Reg2 phases=3 windings=2 buses=(852 852R) conns=(wye wye) kvs=(24.9 24.9) kvas=(2500 2500) XHL=0.01 %loadloss=0.01
+New RegControl.Reg2 transformer=Reg2 winding=2 vreg=122 band=2 ptratio=120
+Set VoltageBases=[69.0 24.9 4.16]
+CalcVoltageBases
+Set ControlMode=Static
+Solve mode=snapshot
