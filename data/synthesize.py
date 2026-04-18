@@ -42,6 +42,7 @@ class SimConfig:
     bm_pv_kw_per_bus: float = 0.0  # behind-meter PV nameplate per bus (avg)
     seed: int = 7
     weather_source: str = "noaa"  # "noaa" or "synthetic"
+    customer_source: str = "smart_ds"  # "smart_ds" or "synthetic"
 
     def __post_init__(self):
         if self.heatwave_windows is None and self.weather_source == "synthetic":
@@ -219,29 +220,43 @@ def synth_loads(cfg: SimConfig) -> Dict[str, np.ndarray | pd.DatetimeIndex]:
     ev_shape = EV_SHAPE[hod]
 
     # Use ALL buses from the topology graph so the GNN sees the full network.
-    # Junction / transformer buses without spot loads get a small ambient draw
-    # (e.g., line losses, a few unmodeled service drops).
     bus_list = sorted(fg.g.nodes())
     n_bus = len(bus_list)
-
-    # Per-bus phase offset (geographic variation in evening peak timing)
-    phase = RNG.uniform(-0.5, 0.5, size=n_bus)  # hours
-    bus_noise_amp = RNG.uniform(0.04, 0.10, size=n_bus)
+    nominal_map = {b: SPOT_LOADS_KW.get(b, 0.5) for b in bus_list}
 
     # Behind-meter PV offset (kW) per bus — proportional to nameplate * GHI/1000
     pv_nameplate = RNG.uniform(0.0, 2.0 * cfg.bm_pv_kw_per_bus, size=n_bus) if cfg.bm_pv_kw_per_bus > 0 else np.zeros(n_bus)
 
+    # Base per-bus shape: SMART-DS customer-mix profiles, or fall back to
+    # the procedural residential shape with phase shifts.
+    if cfg.customer_source == "smart_ds":
+        try:
+            from .smart_ds import fetch_profiles, synth_bus_loads_smart_ds
+            profiles = fetch_profiles(n_residential=8, n_commercial=5)
+            base_kw = synth_bus_loads_smart_ds(bus_list, nominal_map, idx, profiles, seed=cfg.seed)
+            # SMART-DS already encodes Austin 2018 customer behavior. Apply a
+            # gentler Phoenix-specific HVAC overlay (still want extreme heat
+            # to push loads higher than the embedded Austin baseline).
+            phx_hvac = 1.0 + 0.005 * np.clip(temp - 24.0, 0.0, None) + 0.0003 * np.clip(temp - 24.0, 0.0, None) ** 2
+            base_kw = base_kw * phx_hvac[None, :].astype(np.float32)
+            customer_label = "smart_ds"
+        except Exception as e:
+            print(f"[synthesize] SMART-DS unavailable ({e}); falling back to procedural shapes")
+            base_kw = _procedural_bus_loads(bus_list, nominal_map, idx, hod, hvac, week_factor)
+            customer_label = "procedural"
+    else:
+        base_kw = _procedural_bus_loads(bus_list, nominal_map, idx, hod, hvac, week_factor)
+        customer_label = "procedural"
+
+    # EV evening-peak overlay (per-bus, scaled to bus nominal) and PV offset.
     loads = np.zeros((n_bus, n), dtype=np.float32)
     for i, bus in enumerate(bus_list):
-        nominal = SPOT_LOADS_KW.get(bus, 0.5)  # tiny ambient at non-load buses
-        # phase-shifted hour shape via interpolation
-        shifted_hod = (hod + phase[i]) % 24
-        shape = np.interp(shifted_hod, np.arange(24), HOURLY_SHAPE)
+        nominal = nominal_map[bus]
         ev_extra = (cfg.ev_growth_pct / 100.0) * ev_shape * nominal
         pv_offset = pv_nameplate[i] * (ghi / 1000.0)
-        noise = 1.0 + bus_noise_amp[i] * RNG.standard_normal(n)
-        kw = nominal * shape * hvac * week_factor * noise + ev_extra - pv_offset
-        loads[i] = np.clip(kw, 0.0, None)
+        loads[i] = np.clip(base_kw[i] + ev_extra - pv_offset, 0.0, None).astype(np.float32)
+    print(f"[synthesize] customer_source={customer_label}  buses={n_bus}  "
+          f"window={idx[0]} .. {idx[-1]}  hours={n}")
 
     return {
         "time": idx,
@@ -250,8 +265,24 @@ def synth_loads(cfg: SimConfig) -> Dict[str, np.ndarray | pd.DatetimeIndex]:
         "ev_growth_pct": np.full(n, cfg.ev_growth_pct, dtype=np.float32),
         "bus_list": bus_list,
         "loads_kw": loads,
-        "in_heatwave": _heatwave_mask(idx, cfg.heatwave_windows),
+        "in_heatwave": _heatwave_mask(idx, cfg.heatwave_windows or []),
     }
+
+
+def _procedural_bus_loads(bus_list, nominal_map, idx, hod, hvac, week_factor):
+    """Fallback: prior procedural per-bus shape (phase-shifted residential)."""
+    n_bus = len(bus_list)
+    n = len(idx)
+    phase = RNG.uniform(-0.5, 0.5, size=n_bus)
+    bus_noise_amp = RNG.uniform(0.04, 0.10, size=n_bus)
+    base = np.zeros((n_bus, n), dtype=np.float32)
+    for i, bus in enumerate(bus_list):
+        nominal = nominal_map[bus]
+        shifted_hod = (hod + phase[i]) % 24
+        shape = np.interp(shifted_hod, np.arange(24), HOURLY_SHAPE)
+        noise = 1.0 + bus_noise_amp[i] * RNG.standard_normal(n)
+        base[i] = (nominal * shape * hvac * week_factor * noise).astype(np.float32)
+    return base
 
 
 def _heatwave_mask(idx: pd.DatetimeIndex, windows) -> np.ndarray:
@@ -301,35 +332,76 @@ def load_dataset(file: Path) -> Dict:
     }
 
 
+def synth_multi_window(windows: List[Tuple[str, int, str]], cfg_kwargs: dict) -> dict:
+    """Stitch together per-summer datasets into a single multi-year payload.
+
+    `windows` = list of (start, days, weather_source) tuples. The returned
+    dict mirrors `synth_loads` output but covers all windows concatenated
+    chronologically.
+    """
+    payloads = []
+    for start, days, src in windows:
+        cfg = SimConfig(start=start, days=days, weather_source=src, **cfg_kwargs)
+        payloads.append(synth_loads(cfg))
+    bus_list = payloads[0]["bus_list"]
+    return {
+        "time": pd.DatetimeIndex(np.concatenate([p["time"].asi8 for p in payloads])).tz_localize("UTC").tz_convert("America/Phoenix"),
+        "temp_c": np.concatenate([p["temp_c"] for p in payloads]),
+        "ghi": np.concatenate([p["ghi"] for p in payloads]),
+        "ev_growth_pct": np.concatenate([p["ev_growth_pct"] for p in payloads]),
+        "bus_list": bus_list,
+        "loads_kw": np.concatenate([p["loads_kw"] for p in payloads], axis=1),
+        "in_heatwave": np.concatenate([p["in_heatwave"] for p in payloads]),
+    }
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--out", type=Path, default=Path(__file__).parent / "synthetic")
+    p.add_argument("--multi", action="store_true",
+                   help="Generate multi-year dataset (2024+2025 real, 2026 projected)")
     p.add_argument("--days", type=int, default=92)
     p.add_argument("--start", default="2024-06-01")
     p.add_argument("--source", default="noaa", choices=["noaa", "synthetic"])
+    p.add_argument("--customers", default="smart_ds", choices=["smart_ds", "synthetic"])
     args = p.parse_args()
 
-    base_cfg = SimConfig(start=args.start, days=args.days,
-                         ev_growth_pct=0.0, bm_pv_kw_per_bus=0.0,
-                         weather_source=args.source)
-    base = synth_loads(base_cfg)
-    f1 = save_dataset(args.out, base, "baseline")
+    if args.multi:
+        # Three summers: 2024 + 2025 (real NOAA + NSRDB) + 2026 (synthetic
+        # projection — real data not yet available for the future summer).
+        windows = [
+            ("2024-06-01", 92, "noaa"),
+            ("2025-06-01", 92, "noaa"),
+            ("2026-06-01", 92, "synthetic"),
+        ]
+        base = synth_multi_window(windows, {"ev_growth_pct": 0.0, "bm_pv_kw_per_bus": 0.0,
+                                            "customer_source": args.customers})
+        stress = synth_multi_window(windows, {"ev_growth_pct": 35.0, "bm_pv_kw_per_bus": 8.0,
+                                              "customer_source": args.customers})
+        label = "multi"
+    else:
+        base_cfg = SimConfig(start=args.start, days=args.days,
+                             ev_growth_pct=0.0, bm_pv_kw_per_bus=0.0,
+                             weather_source=args.source,
+                             customer_source=args.customers)
+        base = synth_loads(base_cfg)
+        stress_cfg = SimConfig(start=args.start, days=args.days,
+                               ev_growth_pct=35.0, bm_pv_kw_per_bus=8.0,
+                               weather_source=args.source,
+                               customer_source=args.customers)
+        stress = synth_loads(stress_cfg)
+        label = "single"
 
-    stress_cfg = SimConfig(start=args.start, days=args.days,
-                           ev_growth_pct=35.0, bm_pv_kw_per_bus=8.0,
-                           weather_source=args.source)
-    stress = synth_loads(stress_cfg)
+    f1 = save_dataset(args.out, base, "baseline")
     f2 = save_dataset(args.out, stress, "stress_ev35_pv8")
 
-    print(f"Wrote: {f1}\nWrote: {f2}")
     hw_hours = int(base["in_heatwave"].sum())
-    print(
-        f"weather_source={args.source}  start={args.start}  days={args.days}\n"
-        f"baseline temp °C: min={base['temp_c'].min():.1f} max={base['temp_c'].max():.1f} mean={base['temp_c'].mean():.1f}\n"
-        f"baseline mean kW/bus={base['loads_kw'].mean():.2f}  "
-        f"max kW/bus={base['loads_kw'].max():.2f}  heatwave hours={hw_hours}\n"
-        f"baseline heatwave windows: {base_cfg.heatwave_windows}"
-    )
+    print(f"\nWrote: {f1}\nWrote: {f2}")
+    print(f"mode={label}  customers={args.customers}")
+    print(f"baseline window: {base['time'][0]} .. {base['time'][-1]}  hours={len(base['time'])}")
+    print(f"baseline temp °C: min={base['temp_c'].min():.1f} max={base['temp_c'].max():.1f} mean={base['temp_c'].mean():.1f}")
+    print(f"baseline kW: mean={base['loads_kw'].mean():.2f}  max={base['loads_kw'].max():.2f}  "
+          f"heatwave hours={hw_hours}")
 
 
 if __name__ == "__main__":

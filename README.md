@@ -82,28 +82,40 @@ The default mode (`weather_source="noaa"`) drives the load model with
   imagery. Average daytime GHI 528 W/m², peak 1076 W/m², ~6.5%
   cloud loss vs. clear-sky. Falls back to a NOAA-cloud-attenuated
   clear-sky model if no NSRDB key is configured.
-- **Demand**: HVAC cooling sensitivity grows quadratically above 24°C;
-  per-bus phase shifts simulate geographic variation; weekend factors
-  applied. Per-bus loads remain synthetic (real APS AMI traces are not
-  publicly distributed; the hackathon brief allows synthetic with
-  documented assumptions).
+- **Per-bus demand**: per-customer hourly load shapes from **NREL
+  SMART-DS** (Austin TX, P1R substation, 2018) — public no-auth dataset
+  hosted on the OEDI Open Energy Data Initiative S3 bucket. We sample
+  8 residential + 5 commercial customers, then for each IEEE 34 bus
+  draw a deterministic mix of customers sized to the bus's nominal kW
+  (small residential pockets vs. commercial-dominated load centers).
+  This injects realistic customer-class diversity: residential profiles
+  peak in the evening, commercial profiles peak mid-morning, mixed
+  pockets are flatter. A gentler Phoenix-specific HVAC overlay is
+  applied on top so extreme heat still pushes loads above the embedded
+  Austin baseline. Real APS AMI traces are not publicly distributed; the
+  hackathon brief allows synthetic with documented assumptions.
 - **EV stress**: NREL EVI-Pro style residential evening curve, scaled
   to add up to 35% of nominal at the evening peak.
 - **PV offset**: behind-meter solar proportional to GHI / 1000 W/m².
 
-Both real-data feeds are cached as Parquet files under `data/noaa_cache/`
-and `data/nsrdb_cache/`, so cold deploys (e.g. on Streamlit Cloud) work
-without runtime API calls or keys. To refresh from source:
+All real-data feeds are cached as Parquet files under `data/noaa_cache/`,
+`data/nsrdb_cache/`, and `data/smart_ds_cache/`, so cold deploys (e.g. on
+Streamlit Cloud) work without runtime API calls or keys. The committed
+dataset spans **three summers** (Jun-Aug 2024, 2025, 2026) — 2024 and
+2025 use real NOAA observations, 2026 uses a synthetic projection since
+real summer data isn't yet observable. To refresh from source:
 
 ```bash
 python -m data.noaa_real --start 2024-06-01 --end 2024-08-31  # no key
 NREL_API_KEY=xxxx python -m data.nsrdb_real \
     --start 2024-06-01 --end 2024-08-31 \
     --email you@example.com                                    # free key
+python -m data.smart_ds --n_res 8 --n_com 5                   # no key
+python -m data.synthesize --multi                              # build .npz
 ```
 
-A full **synthetic** mode (`--source synthetic`) is preserved for tests
-and reproducibility.
+A full **synthetic** mode (`--source synthetic --customers synthetic`)
+is preserved for tests and reproducibility.
 
 ---
 
