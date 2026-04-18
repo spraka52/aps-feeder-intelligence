@@ -15,6 +15,7 @@ from typing import Dict, List
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import pydeck as pdk
 import streamlit as st
 import torch
 
@@ -48,22 +49,10 @@ def _get_dataset(npz_path_str: str):
 
 @st.cache_data(show_spinner="Solving OpenDSS power flow…")
 def _solve(forecast_kw_bytes: bytes, bus_order: tuple, shape: tuple) -> List[dict]:
+    from physics.opendss_runner import _hourresult_to_dict
     forecast_kw = np.frombuffer(forecast_kw_bytes, dtype=np.float32).reshape(shape)
     results = run_forecast_horizon(forecast_kw, list(bus_order))
-    # Convert dataclasses to plain dicts for caching
-    return [
-        {
-            "hour_index": r.hour_index,
-            "bus_voltage_pu": r.bus_voltage_pu,
-            "line_loading_pct": r.line_loading_pct,
-            "voltage_violations": r.voltage_violations,
-            "thermal_overloads": r.thermal_overloads,
-            "converged": r.converged,
-            "total_load_kw": r.total_load_kw,
-            "total_losses_kw": r.total_losses_kw,
-        }
-        for r in results
-    ]
+    return [_hourresult_to_dict(r) for r in results]
 
 
 def _to_hour_results(dicts: List[dict]):
@@ -73,74 +62,169 @@ def _to_hour_results(dicts: List[dict]):
 
 # --- UI helpers ------------------------------------------------------------- #
 
+def _v_to_color(v: float) -> List[int]:
+    """Map a voltage in pu to an RGBA color (red→amber→green→amber→red).
+
+    0.93 → deep red, 0.95 → amber (lower limit), 1.00 → green, 1.05 → amber,
+    1.07 → deep red. Anything outside [0.93, 1.07] is clamped.
+    """
+    if v is None or np.isnan(v):
+        return [128, 128, 128, 200]
+    # Distance from nominal scaled so 0.05 pu = full saturation
+    dist = abs(v - 1.00) / 0.05
+    dist = max(0.0, min(dist, 1.5))
+    if dist <= 0.5:
+        # Healthy band: green → amber
+        t = dist / 0.5
+        r = int(80 + (235 - 80) * t)
+        g = int(195 + (200 - 195) * t)
+        b = int(80 + (60 - 80) * t)
+    else:
+        # Out of band: amber → red
+        t = min((dist - 0.5) / 1.0, 1.0)
+        r = int(235 + (210 - 235) * t)
+        g = int(200 + (50 - 200) * t)
+        b = int(60 + (50 - 60) * t)
+    return [r, g, b, 230]
+
+
 def feeder_map(
     bus_voltages_per_hour: List[Dict[str, float]],
     hour_idx: int,
     actions_df: pd.DataFrame,
     title: str,
 ):
+    """Geographic map of the feeder using PyDeck + a Carto basemap.
+
+    Each bus is a circle whose colour encodes its voltage at the selected
+    hour and whose radius scales with its nominal load. Lines are drawn as
+    grey paths between connected buses. Buses targeted by the decision
+    engine get a yellow outer halo + a label, so the operator's eye lands
+    on them immediately.
+    """
     fg = build_graph()
     voltages = bus_voltages_per_hour[min(hour_idx, len(bus_voltages_per_hour) - 1)]
-    edge_x, edge_y = [], []
-    for u, v, _ in fg.g.edges(data=True):
-        if u not in COORDS or v not in COORDS:
-            continue
-        edge_x.extend([COORDS[u][1], COORDS[v][1], None])
-        edge_y.extend([COORDS[u][0], COORDS[v][0], None])
-
-    node_x = [COORDS[b][1] for b in fg.g.nodes() if b in COORDS]
-    node_y = [COORDS[b][0] for b in fg.g.nodes() if b in COORDS]
-    node_text = []
-    node_color = []
-    for b in fg.g.nodes():
-        if b not in COORDS:
-            continue
-        v = voltages.get(b)
-        if v is None:
-            node_color.append(0.0)
-            node_text.append(f"Bus {b}<br>v: n/a")
-        else:
-            node_color.append(v)
-            node_text.append(f"Bus {b}<br>v: {v:.3f} pu")
 
     flagged = set()
     if not actions_df.empty:
         flagged = set(actions_df["bus_or_line"].astype(str).tolist())
 
-    flag_x = [COORDS[b][1] for b in fg.g.nodes() if b in flagged and b in COORDS]
-    flag_y = [COORDS[b][0] for b in fg.g.nodes() if b in flagged and b in COORDS]
+    nodes = []
+    halos = []
+    labels = []
+    for b in fg.g.nodes():
+        if b not in COORDS:
+            continue
+        lat, lon = COORDS[b]
+        v = voltages.get(b)
+        nominal_kw = SPOT_LOADS_KW.get(b, 0.0)
+        radius = 35 + 0.55 * float(nominal_kw)  # meters
+        nodes.append({
+            "bus": b,
+            "lat": lat,
+            "lon": lon,
+            "v_pu": float(v) if v is not None else None,
+            "v_label": f"{v:.3f} pu" if v is not None else "n/a",
+            "nominal_kw": float(nominal_kw),
+            "color": _v_to_color(v),
+            "radius": radius,
+            "is_flagged": b in flagged,
+        })
+        if b in flagged:
+            halos.append({
+                "bus": b, "lat": lat, "lon": lon,
+                "radius": radius * 2.4,
+                "color": [255, 196, 0, 200],  # APS gold
+            })
+        if b in flagged or nominal_kw >= 100:
+            labels.append({
+                "lat": lat,
+                "lon": lon,
+                "text": f"{b}" + ("  ⚠" if b in flagged else ""),
+            })
 
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=edge_x, y=edge_y, mode="lines",
-        line=dict(color="#777", width=1.2), hoverinfo="skip", showlegend=False,
-    ))
-    fig.add_trace(go.Scatter(
-        x=node_x, y=node_y, mode="markers+text",
-        marker=dict(
-            size=14, color=node_color, colorscale="RdYlGn",
-            cmin=0.93, cmax=1.05, showscale=True,
-            colorbar=dict(title="V (pu)", thickness=12),
-            line=dict(color="#222", width=0.5),
-        ),
-        text=[b for b in fg.g.nodes() if b in COORDS],
-        textposition="top center", textfont=dict(size=9),
-        hovertext=node_text, hoverinfo="text", showlegend=False,
-    ))
-    if flag_x:
-        fig.add_trace(go.Scatter(
-            x=flag_x, y=flag_y, mode="markers",
-            marker=dict(symbol="x", size=18, color="black", line=dict(width=2)),
-            name="action targets", showlegend=True,
-        ))
-    fig.update_layout(
-        title=title, height=520,
-        xaxis=dict(title="lon", showgrid=False),
-        yaxis=dict(title="lat", showgrid=False, scaleanchor="x", scaleratio=1.2),
-        margin=dict(l=10, r=10, t=40, b=10),
-        paper_bgcolor="white", plot_bgcolor="white",
+    edges = []
+    for u, v, data in fg.g.edges(data=True):
+        if u not in COORDS or v not in COORDS:
+            continue
+        edges.append({
+            "from_bus": u, "to_bus": v,
+            "kind": data.get("kind", "line"),
+            "color": [180, 50, 50, 220] if data.get("kind") == "transformer" else [120, 130, 140, 200],
+            "width": 5 if data.get("kind") == "transformer" else 3,
+            "path": [[COORDS[u][1], COORDS[u][0]], [COORDS[v][1], COORDS[v][0]]],
+        })
+
+    # Center on the centroid; fit zoom to span
+    lats = [c[0] for c in COORDS.values()]
+    lons = [c[1] for c in COORDS.values()]
+    view = pdk.ViewState(
+        latitude=(min(lats) + max(lats)) / 2,
+        longitude=(min(lons) + max(lons)) / 2,
+        zoom=11.6, pitch=35, bearing=0,
     )
-    return fig
+
+    layers = [
+        pdk.Layer(
+            "PathLayer", data=edges, get_path="path",
+            get_color="color", get_width="width",
+            width_min_pixels=2, width_max_pixels=6,
+            pickable=True,
+        ),
+        pdk.Layer(
+            "ScatterplotLayer", data=halos,
+            get_position=["lon", "lat"], get_radius="radius",
+            get_fill_color="color", stroked=False, opacity=0.55,
+        ),
+        pdk.Layer(
+            "ScatterplotLayer", data=nodes,
+            get_position=["lon", "lat"], get_radius="radius",
+            get_fill_color="color", stroked=True,
+            get_line_color=[20, 25, 30, 240], line_width_min_pixels=1,
+            pickable=True,
+        ),
+        pdk.Layer(
+            "TextLayer", data=labels,
+            get_position=["lon", "lat"],
+            get_text="text", get_size=14,
+            get_color=[235, 235, 240, 255],
+            get_alignment_baseline="'bottom'",
+            get_text_anchor="'middle'",
+            background=True,
+            background_padding=[3, 1],
+            get_background_color=[15, 22, 30, 200],
+        ),
+    ]
+
+    return pdk.Deck(
+        layers=layers,
+        initial_view_state=view,
+        map_style="dark",  # uses Carto dark basemap (no Mapbox token)
+        tooltip={
+            "html": (
+                "<b>Bus {bus}</b><br/>"
+                "Voltage: <b>{v_label}</b><br/>"
+                "Nominal load: {nominal_kw:.0f} kW"
+            ),
+            "style": {"backgroundColor": "rgb(30,32,38)", "color": "white", "fontSize": "12px"},
+        },
+    )
+
+
+def voltage_legend():
+    """Compact text legend explaining the colour ramp."""
+    return st.markdown(
+        """
+        <div style="display:flex; gap:20px; align-items:center; font-size:12px; opacity:0.85;">
+          <span style="display:flex;align-items:center;gap:6px;"><span style="width:14px;height:14px;border-radius:50%;background:#50C350;display:inline-block;"></span>~1.00 pu (healthy)</span>
+          <span style="display:flex;align-items:center;gap:6px;"><span style="width:14px;height:14px;border-radius:50%;background:#EBC83C;display:inline-block;"></span>0.95 / 1.05 pu (limit)</span>
+          <span style="display:flex;align-items:center;gap:6px;"><span style="width:14px;height:14px;border-radius:50%;background:#D23232;display:inline-block;"></span>≤0.93 / ≥1.07 pu (violation)</span>
+          <span style="display:flex;align-items:center;gap:6px;"><span style="width:14px;height:14px;border-radius:50%;background:#FFC400;opacity:0.8;display:inline-block;"></span>action target (halo)</span>
+          <span style="display:flex;align-items:center;gap:6px;"><span style="width:18px;height:4px;background:#B43232;display:inline-block;"></span>transformer</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def horizon_chart(forecast_kw: np.ndarray, times, label: str):
@@ -167,6 +251,27 @@ def violations_chart(results, times, label: str):
     fig.update_layout(
         title=f"{label}: per-hour OpenDSS violations",
         barmode="stack", height=260, margin=dict(l=10, r=10, t=40, b=10),
+    )
+    return fig
+
+
+def reg_tap_chart(results, times, label: str):
+    """Show regulator tap positions across the QSTS horizon."""
+    if not results:
+        return go.Figure()
+    reg_names = sorted({k for r in results for k in r.regulator_taps.keys()})
+    fig = go.Figure()
+    for name in reg_names:
+        ys = [r.regulator_taps.get(name, None) for r in results]
+        fig.add_trace(go.Scatter(
+            x=list(times), y=ys, mode="lines+markers",
+            name=name.upper(), line=dict(width=2),
+        ))
+    fig.update_layout(
+        title=f"{label}: regulator tap positions (QSTS)",
+        xaxis_title="time", yaxis_title="tap step (+ boost / – buck)",
+        height=260, margin=dict(l=10, r=10, t=40, b=10),
+        legend=dict(orientation="h"),
     )
     return fig
 
@@ -265,22 +370,27 @@ c4.metric("Peak losses (kW)", f"{kpi_stress['peak_loss_kw']:.0f}",
 
 # Spatial maps
 st.subheader("Spatio-temporal feeder map")
-map_hour = st.slider("Hour into the 24-hour forecast", 0, len(fcst_times) - 1, 18,
-                     help="Slide to watch voltages evolve. Black ✕ marks buses or lines flagged for action.")
+map_hour = st.slider(
+    "Hour into the 24-hour forecast", 0, len(fcst_times) - 1, 18,
+    help="Slide to watch voltages evolve hour by hour. Yellow halo = decision-engine action target.",
+)
+voltage_legend()
 mc1, mc2 = st.columns(2)
+voltages_per_hour_base = [r.bus_voltage_pu for r in res_base]
+voltages_per_hour_stress = [r.bus_voltage_pu for r in res_stress]
 with mc1:
-    voltages_per_hour_base = [r.bus_voltage_pu for r in res_base]
-    st.plotly_chart(
+    st.markdown(f"**Baseline · {fcst_times[map_hour]}**")
+    st.pydeck_chart(
         feeder_map(voltages_per_hour_base, map_hour, actions_to_df(actions_base),
                    f"Baseline @ {fcst_times[map_hour]}"),
-        width="stretch",
+        height=480,
     )
 with mc2:
-    voltages_per_hour_stress = [r.bus_voltage_pu for r in res_stress]
-    st.plotly_chart(
+    st.markdown(f"**Stress (heat + EV) · {fcst_times[map_hour]}**")
+    st.pydeck_chart(
         feeder_map(voltages_per_hour_stress, map_hour, actions_to_df(actions_stress),
-                   f"Stress (heat+EV) @ {fcst_times[map_hour]}"),
-        width="stretch",
+                   f"Stress @ {fcst_times[map_hour]}"),
+        height=480,
     )
 
 # Time-series comparisons
@@ -289,9 +399,11 @@ hc1, hc2 = st.columns(2)
 with hc1:
     st.plotly_chart(horizon_chart(fcst_base, fcst_times, "Baseline"), width="stretch")
     st.plotly_chart(violations_chart(res_base, fcst_times, "Baseline"), width="stretch")
+    st.plotly_chart(reg_tap_chart(res_base, fcst_times, "Baseline"), width="stretch")
 with hc2:
     st.plotly_chart(horizon_chart(fcst_stress, fcst_times, "Stress (heat+EV)"), width="stretch")
     st.plotly_chart(violations_chart(res_stress, fcst_times, "Stress (heat+EV)"), width="stretch")
+    st.plotly_chart(reg_tap_chart(res_stress, fcst_times, "Stress (heat+EV)"), width="stretch")
 
 # Action Center
 st.subheader("⚙ Action Center — prioritized utility interventions")

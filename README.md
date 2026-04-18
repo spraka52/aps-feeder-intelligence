@@ -17,7 +17,7 @@ Built for the **APS / ASU AI for Energy** hackathon track.
 | Topology | `data/topology.py` (NetworkX + OpenDSS) | IEEE 34-bus radial feeder, two voltage regulators, in-line 24.9/4.16 kV transformer, geographic coordinates on a Phoenix footprint |
 | Time-series | `data/synthesize.py` | Hourly Phoenix-realistic temperature, NSRDB-style GHI, per-bus residential demand with HVAC sensitivity, EV evening-peak shape (NREL EVI-Pro inspired), behind-meter PV |
 | AI model | `models/graphsage_gru.py` | **GraphSAGE → GRU → linear head** in PyTorch Geometric. ~27k learned parameters. Inputs: per-bus load, temperature, irradiance, hour-of-day (sin/cos), EV-growth %, baseline-kW. Output: 24-hour per-bus kW forecast |
-| Physics | `physics/opendss_runner.py` | OpenDSS snapshot power flow per forecast hour; detects voltage excursions outside [0.95, 1.05] pu and line currents above NormAmps |
+| Physics | `physics/opendss_runner.py` | OpenDSS quasi-static time-series (QSTS) per 24-hour forecast horizon; regulator tap and capacitor switching states evolve across hours instead of resetting per snapshot. Detects voltage excursions outside [0.95, 1.05] pu, thermal overloads above NormAmps, and tracks regulator tap trajectories |
 | Decisions | `decisions/action_engine.py` | Aggregates violations into ranked operator actions (battery dispatch, Volt-VAR, deferrable-load shed) with sized recommendations |
 | UI | `app.py` (Streamlit) | Side-by-side baseline vs. stress map, time-series charts, Action Center |
 
@@ -50,53 +50,79 @@ launched immediately without retraining.
 
 ## Deploy to Streamlit Community Cloud
 
-This repo is set up for one-click deploy:
+Live demo: **[aps-feeder.streamlit.app](https://aps-feeder.streamlit.app/)**
 
-1. Push this repo to a public GitHub repo (already true if you cloned it).
-2. Go to [share.streamlit.io](https://share.streamlit.io) and sign in with GitHub.
-3. Click **New app**, select this repo / branch / `app.py`.
-4. Streamlit Cloud reads `requirements.txt` (Python 3.13 from `runtime.txt`),
-   builds the env, and serves the dashboard at a public URL.
+To redeploy your own:
 
-The repo intentionally commits the small synthetic `.npz` datasets and the
-112 KB model checkpoint so cold deploys work without running training.
+1. Fork the repo to your GitHub.
+2. Go to [share.streamlit.io](https://share.streamlit.io), sign in with GitHub.
+3. **New app** → select your fork / `main` / `app.py` → Deploy.
+
+The repo commits the small synthetic `.npz` datasets, the model checkpoint,
+the cached NOAA/NSRDB parquets, and the OpenDSS deck — so the app works
+**without any API keys at runtime**. To refresh real-data caches you only
+need a free NREL API key set as the `NREL_API_KEY` environment variable
+(or in Streamlit Cloud's *Settings → Secrets*: `NREL_API_KEY = "..."`).
 
 ---
 
 ## Data realism
 
-Synthetic data is used so the pipeline runs end-to-end with one command,
-but every driver is climatologically motivated:
+The default mode (`weather_source="noaa"`) drives the load model with
+**real Phoenix observations**:
 
-- **Temperature**: diurnal cycle peaking at ~16:00 local, summer high
-  39–46°C with two ~7-day heatwave events bumping +5 to +8°C.
-- **Irradiance**: clear-sky GHI from solar geometry at lat 33.45°N,
-  modulated by an AR(1) cloud factor.
+- **Temperature**: hourly KPHX (Phoenix Sky Harbor) air temperature from
+  **NOAA NCEI ISD-Lite** for Jun–Aug 2024. Peak 47.2°C, mean 37.1°C, with
+  a real-life *42-day continuous heatwave* (Jun 20 – Jul 31 2024, all
+  daily highs ≥ 41°C). Heatwave windows are auto-detected (≥ 3 consecutive
+  days ≥ 41°C) instead of being hard-coded. No API key required —
+  ISD-Lite is public bulk data.
+- **Irradiance**: hourly GHI / DNI / DHI from **NREL NSRDB** (GOES
+  Aggregated PSM v4.0.0) for Phoenix 2024, satellite-derived from cloud
+  imagery. Average daytime GHI 528 W/m², peak 1076 W/m², ~6.5%
+  cloud loss vs. clear-sky. Falls back to a NOAA-cloud-attenuated
+  clear-sky model if no NSRDB key is configured.
 - **Demand**: HVAC cooling sensitivity grows quadratically above 24°C;
-  per-bus phase shifts simulate geographic variation; weekend / holiday
-  factors applied.
+  per-bus phase shifts simulate geographic variation; weekend factors
+  applied. Per-bus loads remain synthetic (real APS AMI traces are not
+  publicly distributed; the hackathon brief allows synthetic with
+  documented assumptions).
 - **EV stress**: NREL EVI-Pro style residential evening curve, scaled
   to add up to 35% of nominal at the evening peak.
 - **PV offset**: behind-meter solar proportional to GHI / 1000 W/m².
 
-Real NOAA, NREL NSRDB, and EVI-Pro feeds can be dropped in by replacing
-the `synth_*` functions with API loaders. Inputs and outputs are all
-plain `np.ndarray`s so the rest of the pipeline is unaffected.
+Both real-data feeds are cached as Parquet files under `data/noaa_cache/`
+and `data/nsrdb_cache/`, so cold deploys (e.g. on Streamlit Cloud) work
+without runtime API calls or keys. To refresh from source:
+
+```bash
+python -m data.noaa_real --start 2024-06-01 --end 2024-08-31  # no key
+NREL_API_KEY=xxxx python -m data.nsrdb_real \
+    --start 2024-06-01 --end 2024-08-31 \
+    --email you@example.com                                    # free key
+```
+
+A full **synthetic** mode (`--source synthetic`) is preserved for tests
+and reproducibility.
 
 ---
 
 ## Model performance
 
-Held-out validation (last 20% of the 92-day window):
+Trained on real NOAA temperature + real NSRDB irradiance for Phoenix
+Jun–Aug 2024; held-out validation on the last 20% of the window:
 
 ```
-Overall   RMSE ~30 kW  •  MAE ~10 kW  •  MAPE ~17%
-Heatwave  RMSE ~37 kW  •  MAE ~16 kW  •  MAPE ~22%
-Normal    RMSE ~28 kW  •  MAE ~9 kW   •  MAPE ~16%
+Overall   RMSE 19.3 kW  •  MAPE 18.9%
+Heatwave  RMSE 17.7 kW  •  MAPE  ~17%
+Normal    RMSE 19.7 kW  •  MAPE  ~19%
 ```
 
 Heatwave error is intentionally surfaced as a separate metric so the model
 is judged where it matters — the regime where the feeder is most stressed.
+The model performs *better* during heatwaves because heat is a strong
+signal: the relationship between temperature, time of day, and HVAC
+load is more predictable than non-heatwave variability.
 
 The training script writes `models/checkpoints/training_report.json` with
 the full history; the dashboard renders it under "Model performance".

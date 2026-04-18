@@ -59,6 +59,9 @@ class HourResult:
     converged: bool = True
     total_load_kw: float = 0.0
     total_losses_kw: float = 0.0
+    # QSTS-only diagnostics (dict of element-name -> position/state)
+    regulator_taps: Dict[str, int] = field(default_factory=dict)
+    capacitor_states: Dict[str, int] = field(default_factory=dict)
 
 
 def _ensure_deck() -> Path:
@@ -134,6 +137,31 @@ def _collect_results(hour_index: int) -> HourResult:
     total_kw = abs(dss.Circuit.TotalPower()[0])
     total_losses_kw = dss.Circuit.Losses()[0] / 1000.0
 
+    # Regulator tap positions (integer steps from neutral; +ve = boost)
+    reg_taps: Dict[str, int] = {}
+    if dss.RegControls.First() > 0:
+        while True:
+            name = dss.RegControls.Name()
+            try:
+                reg_taps[name] = int(dss.RegControls.TapNumber())
+            except Exception:
+                pass
+            if dss.RegControls.Next() == 0:
+                break
+
+    # Capacitor on/off state (1 = at least one step in, 0 = all out)
+    cap_states: Dict[str, int] = {}
+    if dss.Capacitors.First() > 0:
+        while True:
+            name = dss.Capacitors.Name()
+            try:
+                steps = dss.Capacitors.States()
+                cap_states[name] = int(any(s > 0 for s in steps))
+            except Exception:
+                pass
+            if dss.Capacitors.Next() == 0:
+                break
+
     return HourResult(
         hour_index=hour_index,
         bus_voltage_pu=bus_v,
@@ -143,11 +171,14 @@ def _collect_results(hour_index: int) -> HourResult:
         converged=True,
         total_load_kw=float(total_kw),
         total_losses_kw=float(total_losses_kw),
+        regulator_taps=reg_taps,
+        capacitor_states=cap_states,
     )
 
 
 def _run_horizon_in_process(per_hour_load_kw: np.ndarray, bus_order: List[str]) -> List[HourResult]:
-    """In-process solve. Used inside the subprocess worker."""
+    """In-process snapshot solve — each hour is independent. Used as a fallback
+    when QSTS is disabled."""
     deck = _ensure_deck()
     _load_deck(deck)
     results: List[HourResult] = []
@@ -171,6 +202,48 @@ def _run_horizon_in_process(per_hour_load_kw: np.ndarray, bus_order: List[str]) 
     return results
 
 
+def _run_horizon_qsts(per_hour_load_kw: np.ndarray, bus_order: List[str]) -> List[HourResult]:
+    """Quasi-static time-series (QSTS) solve.
+
+    Defines a Loadshape per load with the forecast multipliers, then advances
+    OpenDSS one hour at a time in `daily` mode. Regulator tap and capacitor
+    control actions accumulate across timesteps instead of resetting, so the
+    voltage/current trajectory reflects how the network actually responds to
+    a load curve rather than treating each hour as an independent puzzle.
+    """
+    import opendssdirect as dss
+    deck = _ensure_deck()
+    _load_deck(deck)
+
+    nominal = np.array([SPOT_LOADS_KW.get(b, 0.0) for b in bus_order], dtype=float)
+    safe_nom = np.where(nominal > 0, nominal, 1.0)
+    T = per_hour_load_kw.shape[0]
+
+    # 1) Define a Loadshape per load and bind it to the load's `daily` shape.
+    for i, bus in enumerate(bus_order):
+        if nominal[i] <= 0:
+            continue
+        mults = per_hour_load_kw[:, i] / safe_nom[i]
+        mult_str = " ".join(f"{float(m):.5f}" for m in mults)
+        dss.Text.Command(f"New Loadshape.LS_{bus} npts={T} interval=1.0 mult=({mult_str})")
+        dss.Text.Command(f"Edit Load.LD_{bus} daily=LS_{bus}")
+
+    # 2) Switch to daily mode, 1-hour steps, fresh state.
+    dss.Text.Command("Set Mode=daily Number=1 Stepsize=1h Hour=0")
+    dss.Text.Command("Set ControlMode=Static MaxControlIter=20")
+
+    # 3) March one hour at a time, capturing results after each Solve.
+    results: List[HourResult] = []
+    for t in range(T):
+        dss.Solution.Solve()
+        if dss.Solution.Converged():
+            res = _collect_results(t)
+        else:
+            res = HourResult(hour_index=t, bus_voltage_pu={}, line_loading_pct={}, converged=False)
+        results.append(res)
+    return results
+
+
 def _hourresult_to_dict(r: HourResult) -> dict:
     return {
         "hour_index": r.hour_index,
@@ -181,6 +254,8 @@ def _hourresult_to_dict(r: HourResult) -> dict:
         "converged": r.converged,
         "total_load_kw": r.total_load_kw,
         "total_losses_kw": r.total_losses_kw,
+        "regulator_taps": r.regulator_taps,
+        "capacitor_states": r.capacitor_states,
     }
 
 
@@ -193,11 +268,16 @@ def run_forecast_horizon(
     bus_order: List[str],
     use_subprocess: bool = True,
     timeout_s: float = 60.0,
+    mode: str = "qsts",
 ) -> List[HourResult]:
     """Run OpenDSS for each forecast hour.
 
     per_hour_load_kw: shape [T_out, N] — predicted kW per bus.
     bus_order:        list of length N matching the predictor.
+    mode:             "qsts" (default, recommended) — daily-mode time-series
+                       so regulator/cap controls evolve across hours.
+                      "snapshot" — independent snapshot solve per hour
+                       (kept for comparison / debugging).
 
     By default each call runs in a fresh `python -m physics._solver_worker`
     subprocess so a SIGILL inside the OpenDSS native engine never crashes
@@ -206,11 +286,14 @@ def run_forecast_horizon(
     rendering with a friendly warning.
     """
     if not use_subprocess:
+        if mode == "qsts":
+            return _run_horizon_qsts(per_hour_load_kw, bus_order)
         return _run_horizon_in_process(per_hour_load_kw, bus_order)
 
     payload = pickle.dumps({
         "forecast_kw": np.ascontiguousarray(per_hour_load_kw, dtype=np.float64),
         "bus_order": list(bus_order),
+        "mode": mode,
     })
 
     cmd = [sys.executable, "-m", "physics._solver_worker"]

@@ -25,9 +25,15 @@ def main():
     payload = pickle.loads(sys.stdin.buffer.read())
     arr = payload["forecast_kw"]
     bus_order = payload["bus_order"]
+    mode = payload.get("mode", "qsts")
 
-    from physics.opendss_runner import _run_horizon_in_process, _hourresult_to_dict
-    results = _run_horizon_in_process(arr, bus_order)
+    from physics.opendss_runner import (
+        _run_horizon_in_process,
+        _run_horizon_qsts,
+        _hourresult_to_dict,
+    )
+    runner = _run_horizon_qsts if mode == "qsts" else _run_horizon_in_process
+    results = runner(arr, bus_order)
     out = [_hourresult_to_dict(r) for r in results]
     sys.stdout.buffer.write(pickle.dumps(out))
     sys.stdout.buffer.flush()

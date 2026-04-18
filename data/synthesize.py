@@ -35,19 +35,20 @@ RNG = np.random.default_rng(7)
 
 @dataclass
 class SimConfig:
-    start: str = "2025-06-01"
+    start: str = "2024-06-01"
     days: int = 92               # Jun-Aug peak summer
-    heatwave_windows: List[Tuple[str, str]] = None  # (start, end) inclusive
+    heatwave_windows: List[Tuple[str, str]] = None  # (start, end) inclusive — auto if None+real
     ev_growth_pct: float = 0.0   # additional fleet evening-peak load as % of baseline
     bm_pv_kw_per_bus: float = 0.0  # behind-meter PV nameplate per bus (avg)
     seed: int = 7
+    weather_source: str = "noaa"  # "noaa" or "synthetic"
 
     def __post_init__(self):
-        if self.heatwave_windows is None:
-            # Two synthetic but realistic Phoenix-like heatwave events
+        if self.heatwave_windows is None and self.weather_source == "synthetic":
+            # Two procedural Phoenix-like heatwave events (synthetic mode only)
             self.heatwave_windows = [
-                ("2025-07-08", "2025-07-14"),
-                ("2025-08-12", "2025-08-18"),
+                ("2024-07-08", "2024-07-14"),
+                ("2024-08-12", "2024-08-18"),
             ]
 
 
@@ -88,30 +89,64 @@ def synth_temperature(idx: pd.DatetimeIndex, heatwaves: List[Tuple[str, str]]) -
     return t
 
 
-def synth_irradiance(idx: pd.DatetimeIndex, lat: float = 33.45) -> np.ndarray:
-    """Approximate hourly GHI (W/m^2) using a clear-sky model + cloud noise."""
+def synth_irradiance(idx: pd.DatetimeIndex, lat: float = 33.45,
+                     cloud_frac: np.ndarray | None = None) -> np.ndarray:
+    """Approximate hourly GHI (W/m^2) using a clear-sky model.
+
+    If `cloud_frac` (0..1, 1=overcast) is provided — typically from NOAA sky
+    coverage — we attenuate clear-sky GHI by (1 - 0.75*cloud_frac). Otherwise
+    we use a stochastic AR(1) cloud factor.
+    """
     doy = idx.dayofyear.values
     hour = idx.hour.values + idx.minute.values / 60.0
 
     # Solar declination
     decl = 23.45 * np.sin(np.radians(360.0 * (284 + doy) / 365.0))
-    # Hour angle (15° per hour from solar noon, assume local solar time ~ index hour - 1)
     h_angle = 15.0 * (hour - 12.0)
-    # Solar elevation
     sin_alpha = (
         np.sin(np.radians(lat)) * np.sin(np.radians(decl))
         + np.cos(np.radians(lat)) * np.cos(np.radians(decl)) * np.cos(np.radians(h_angle))
     )
     sin_alpha = np.clip(sin_alpha, 0.0, None)
-    ghi_clear = 1100.0 * sin_alpha  # peak ~1000 W/m^2
+    ghi_clear = 1100.0 * sin_alpha
 
-    # Stochastic clouds: AR(1) factor in [0.4, 1.0]
+    if cloud_frac is not None:
+        atten = 1.0 - 0.75 * np.clip(cloud_frac, 0.0, 1.0)
+        return (ghi_clear * atten).astype(np.float32)
+
+    # Synthetic cloud field: AR(1) in [0.4, 1.0]
     cloud = np.ones(len(idx))
     rho = 0.85
     for i in range(1, len(cloud)):
         cloud[i] = rho * cloud[i - 1] + (1 - rho) * RNG.uniform(0.5, 1.0)
-    ghi = ghi_clear * np.clip(cloud, 0.3, 1.0)
-    return ghi
+    return ghi_clear * np.clip(cloud, 0.3, 1.0)
+
+
+def _detect_heatwaves(idx: pd.DatetimeIndex, temp: np.ndarray,
+                      threshold_c: float = 41.0, min_days: int = 3) -> List[Tuple[str, str]]:
+    """Find runs of ≥ ``min_days`` consecutive calendar days with daily max ≥ threshold."""
+    s = pd.Series(temp, index=idx)
+    daily_max = s.resample("D").max()
+    hot = daily_max >= threshold_c
+    runs: List[Tuple[str, str]] = []
+    if not hot.any():
+        return runs
+    in_run = False
+    run_start: pd.Timestamp | None = None
+    prev_day: pd.Timestamp | None = None
+    for day, is_hot in hot.items():
+        if is_hot:
+            if not in_run:
+                in_run, run_start = True, day
+            prev_day = day
+        else:
+            if in_run and (prev_day - run_start).days + 1 >= min_days:
+                runs.append((str(run_start.date()), str(prev_day.date())))
+            in_run = False
+            run_start = None
+    if in_run and (prev_day - run_start).days + 1 >= min_days:
+        runs.append((str(run_start.date()), str(prev_day.date())))
+    return runs
 
 
 # --- Demand ------------------------------------------------------------------
@@ -144,8 +179,36 @@ def synth_loads(cfg: SimConfig) -> Dict[str, np.ndarray | pd.DatetimeIndex]:
     idx = pd.date_range(cfg.start, periods=cfg.days * 24, freq="h", tz="America/Phoenix")
     n = len(idx)
 
-    temp = synth_temperature(idx, cfg.heatwave_windows)
-    ghi = synth_irradiance(idx)
+    if cfg.weather_source == "noaa":
+        from .noaa_real import get_phoenix as get_noaa
+        end_ts = idx[-1]
+        wx = get_noaa(str(idx[0]), str(end_ts))
+        wx = wx.set_index("time").reindex(idx).interpolate(limit=4).ffill().bfill()
+        temp = wx["temp_c"].to_numpy().astype(np.float32)
+
+        # Try NSRDB for real GHI; fall back to cloud-attenuated clear-sky model.
+        try:
+            from .nsrdb_real import get_phoenix as get_nsrdb, is_available as _nsrdb_ok
+            if _nsrdb_ok():
+                solar = get_nsrdb(str(idx[0]), str(end_ts))
+                solar = solar.set_index("time").reindex(idx).interpolate(limit=4).ffill().bfill()
+                ghi = solar["ghi"].to_numpy().astype(np.float32)
+                irradiance_source = "nsrdb"
+            else:
+                raise RuntimeError("NSRDB unavailable")
+        except Exception as e:
+            print(f"[synthesize] NSRDB GHI unavailable ({e}); using NOAA cloud-attenuated clear-sky model")
+            ghi = synth_irradiance(idx, cloud_frac=wx["cloud_frac"].to_numpy())
+            irradiance_source = "noaa_cloud_attenuated"
+
+        # Auto-detect heatwave windows from real temperature.
+        heatwaves = _detect_heatwaves(idx, temp)
+        cfg.heatwave_windows = heatwaves
+        print(f"[synthesize] weather_source=noaa  irradiance_source={irradiance_source}  "
+              f"heatwave_windows={len(heatwaves)}")
+    else:
+        temp = synth_temperature(idx, cfg.heatwave_windows or [])
+        ghi = synth_irradiance(idx)
     hvac = hvac_multiplier(temp)
     hod = idx.hour.values
     dow = idx.dayofweek.values
@@ -242,20 +305,30 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--out", type=Path, default=Path(__file__).parent / "synthetic")
     p.add_argument("--days", type=int, default=92)
+    p.add_argument("--start", default="2024-06-01")
+    p.add_argument("--source", default="noaa", choices=["noaa", "synthetic"])
     args = p.parse_args()
 
-    base_cfg = SimConfig(days=args.days, ev_growth_pct=0.0, bm_pv_kw_per_bus=0.0)
+    base_cfg = SimConfig(start=args.start, days=args.days,
+                         ev_growth_pct=0.0, bm_pv_kw_per_bus=0.0,
+                         weather_source=args.source)
     base = synth_loads(base_cfg)
     f1 = save_dataset(args.out, base, "baseline")
 
-    stress_cfg = SimConfig(days=args.days, ev_growth_pct=35.0, bm_pv_kw_per_bus=8.0)
+    stress_cfg = SimConfig(start=args.start, days=args.days,
+                           ev_growth_pct=35.0, bm_pv_kw_per_bus=8.0,
+                           weather_source=args.source)
     stress = synth_loads(stress_cfg)
     f2 = save_dataset(args.out, stress, "stress_ev35_pv8")
 
     print(f"Wrote: {f1}\nWrote: {f2}")
+    hw_hours = int(base["in_heatwave"].sum())
     print(
+        f"weather_source={args.source}  start={args.start}  days={args.days}\n"
+        f"baseline temp °C: min={base['temp_c'].min():.1f} max={base['temp_c'].max():.1f} mean={base['temp_c'].mean():.1f}\n"
         f"baseline mean kW/bus={base['loads_kw'].mean():.2f}  "
-        f"max kW/bus={base['loads_kw'].max():.2f}  heatwave hours={int(base['in_heatwave'].sum())}"
+        f"max kW/bus={base['loads_kw'].max():.2f}  heatwave hours={hw_hours}\n"
+        f"baseline heatwave windows: {base_cfg.heatwave_windows}"
     )
 
 

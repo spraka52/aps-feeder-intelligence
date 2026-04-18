@@ -4,7 +4,11 @@ __pycache__/
 .venv/
 .ipynb_checkpoints/
 *.log
-# Local-only screenshot captures from scripts/capture_*.py
+# Local-only screenshot captures
 reports/panels/
 reports/dashboard_*.png
 reports/cache/
+# Local secrets — never commit
+.env
+.streamlit/secrets.toml
+.api_keys
