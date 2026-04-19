@@ -1783,15 +1783,37 @@ def render_planner_view():
         st.error("'From date' must be on or before 'to date'.")
         return
 
-    # Cap range so OpenDSS doesn't take forever (each day = ~1 second of solve)
-    range_days = (to_date - from_date).days + 1
-    if range_days > 28:
+    # The dataset only covers Phoenix summers (Jun-Aug per year). If the user
+    # picks dates outside those windows (e.g. winter), snap to the nearest
+    # actually-available day so we always have data to solve against.
+    avail_set = set(available_dates)
+    snapped = False
+    if from_date not in avail_set:
+        candidates = [d for d in available_dates if d >= from_date]
+        from_date = candidates[0] if candidates else available_dates[0]
+        snapped = True
+    if to_date not in avail_set:
+        candidates = [d for d in available_dates if d <= to_date]
+        to_date = candidates[-1] if candidates else available_dates[-1]
+        snapped = True
+    if from_date > to_date:
+        from_date, to_date = to_date, from_date
+    if snapped:
+        st.info(
+            f"Dataset only covers Phoenix summers — snapped your range to the nearest "
+            f"available days: **{from_date} → {to_date}**."
+        )
+
+    # Cap range using the count of *actual* dataset days inside the picked range
+    days_in_range = sum(1 for d in available_dates if from_date <= d <= to_date)
+    if days_in_range > 28:
         st.warning(
-            f"Range is {range_days} days — capping at 28 days to keep the solve under a minute. "
+            f"Range covers {days_in_range} summer days — capping at 28 to keep the solve under a minute. "
             f"Pick a shorter window if you want exact day boundaries."
         )
-        to_date = available_dates[min(len(available_dates) - 1,
-                                       available_dates.index(from_date) + 27)]
+        # Take the first 28 in-data days starting from from_date
+        in_range_dates = [d for d in available_dates if d >= from_date]
+        to_date = in_range_dates[min(len(in_range_dates) - 1, 27)]
 
     # Build the timezone-aware bounds matching how times are tagged
     tz = times.tz
