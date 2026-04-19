@@ -1447,13 +1447,6 @@ def render_operator_view():
             )
 
     with tab_forecast:
-        # Always-visible held-out validation metrics — what the brief calls out as
-        # "clear error metrics, good performance during stress periods."
-        report_path = REPO / "models" / "checkpoints" / "training_report.json"
-        if report_path.exists():
-            mtime = report_path.stat().st_mtime
-            model_perf_strip(_get_training_report(mtime))
-
         st.plotly_chart(
             horizon_chart(fcst_base, fcst_stress, fcst_times),
             width="stretch",
