@@ -1693,23 +1693,43 @@ def render_planner_view():
     st.markdown(
         f"<div class='role-banner-planner'>"
         f"<b style='color:#6E5BB0;'>PLANNER VIEW</b> &nbsp; "
-        f"Pick a week. We aggregate the OpenDSS QSTS solve across the whole "
-        f"week, identify chronic stress patterns, and propose ranked capital projects "
-        f"with realistic cost ranges, customer SAIDI footprint, and escalation triggers."
+        f"Pick any historical date range. We aggregate the OpenDSS QSTS solve "
+        f"across every hour in that range, identify chronic stress patterns, "
+        f"and propose ranked capital projects with realistic cost ranges, "
+        f"customer SAIDI footprint, and escalation triggers."
         f"</div>",
         unsafe_allow_html=True,
     )
 
-    weeks = _build_summer_weeks(times)
-    if not weeks:
-        st.error("Dataset doesn't contain any full weeks.")
-        return
+    weeks = _build_summer_weeks(times)  # still used for the multi-week trend chart
 
-    week_labels = [f"Week of {ws.strftime('%a %b %d, %Y')}" for ws, _ in weeks]
-    cw1, cw2 = st.columns([3, 2])
+    # ----- Date-range picker (replaces fixed week dropdown) ----- #
+    available_dates = sorted({t.date() for t in times})
+    if not available_dates:
+        st.error("Dataset is empty — nothing to analyse.")
+        return
+    min_date = available_dates[0]
+    max_date = available_dates[-1]
+    # Default to a one-week window starting from a known heatwave preset
+    default_from = available_dates[max(0, len(available_dates) // 4)]
+    default_to = available_dates[min(len(available_dates) - 1,
+                                     available_dates.index(default_from) + 6)]
+
+    cw1, cw2, cw3 = st.columns([1.5, 1.5, 2.5])
     with cw1:
-        pick_week_label = st.selectbox("Week to analyse", week_labels, index=min(2, len(week_labels) - 1))
+        from_date = st.date_input(
+            "From date", value=default_from,
+            min_value=min_date, max_value=max_date,
+            help="Earliest day in the analysis window.",
+        )
     with cw2:
+        to_date = st.date_input(
+            "To date", value=default_to,
+            min_value=min_date, max_value=max_date,
+            help="Latest day in the analysis window. Pick longer ranges for capital "
+                 "planning, shorter for week-by-week comparisons.",
+        )
+    with cw3:
         scenario_for_planner = st.radio(
             "Scenario",
             ["Baseline", "Stress · +35% EV overlay, +8 kW PV/bus"],
@@ -1720,8 +1740,24 @@ def render_planner_view():
                  "+ 8 kW per bus of behind-meter PV nameplate.",
         )
 
-    week_idx = week_labels.index(pick_week_label)
-    ws, we = weeks[week_idx]
+    if from_date > to_date:
+        st.error("'From date' must be on or before 'to date'.")
+        return
+
+    # Cap range so OpenDSS doesn't take forever (each day = ~1 second of solve)
+    range_days = (to_date - from_date).days + 1
+    if range_days > 28:
+        st.warning(
+            f"Range is {range_days} days — capping at 28 days to keep the solve under a minute. "
+            f"Pick a shorter window if you want exact day boundaries."
+        )
+        to_date = available_dates[min(len(available_dates) - 1,
+                                       available_dates.index(from_date) + 27)]
+
+    # Build the timezone-aware bounds matching how times are tagged
+    tz = times.tz
+    ws = pd.Timestamp(from_date, tz=tz)
+    we = pd.Timestamp(to_date,   tz=tz) + pd.Timedelta(hours=23, minutes=59, seconds=59)
 
     is_stress = "stress" in scenario_for_planner.lower()
 
@@ -1738,24 +1774,29 @@ def render_planner_view():
     )
 
     week_mask_base = (ds_base.times >= ws) & (ds_base.times <= we)
+    if week_mask_base.sum() < 24:
+        st.error(
+            f"Range {from_date} to {to_date} contains fewer than 24 hours of data — "
+            f"the dataset only covers {min_date} to {max_date} (Phoenix summers)."
+        )
+        return
     week_times = ds_base.times[week_mask_base]
     week_loads_base = ds_base.loads[:, week_mask_base]
     week_loads_stress = ds_stress.loads[:, week_mask_base]
     week_loads = interpolate_loads(week_loads_base, week_loads_stress, planner_ev_pct)
     ds_for = ds_base  # times / heatwave bookkeeping comes from base
-    week_times = ds_for.times[week_mask_base]
 
     n_days = len(week_times) // 24
     if n_days < 1:
-        st.error("Selected week has fewer than 24 hours of data.")
+        st.error("Selected range has fewer than 24 hours of data.")
         return
     day_kw = week_loads[:, : n_days * 24].T.reshape(n_days, 24, -1).astype(np.float32)
     bus_order = tuple(ds_for.bus_order)
 
-    week_label_key = f"{ws.isoformat()}_ev{planner_ev_pct}"
+    range_label_key = f"{from_date.isoformat()}_{to_date.isoformat()}_ev{planner_ev_pct}"
     per_day_dicts = _solve_week_truth(
         day_kw.astype(np.float32).tobytes(),
-        bus_order, day_kw.shape, week_label_key,
+        bus_order, day_kw.shape, range_label_key,
     )
     per_day_results = [_to_hour_results(d) for d in per_day_dicts]
 
@@ -1777,18 +1818,17 @@ def render_planner_view():
             "peak_kw": float(wk_loads.max()) if wk_loads.size else 0.0,
         })
     trend_df = pd.DataFrame(trend_rows)
-    actual_total = int(weekly_df["violation_hours_week"].sum())
-    if not trend_df.empty:
-        sel_row = trend_df[trend_df["week_start"] == ws]
-        if not sel_row.empty:
-            trend_df.loc[sel_row.index, "total_violation_hours"] = actual_total
 
     total_v = int(weekly_df["violation_hours_week"].sum())
     worst_bus = weekly_df.iloc[0] if not weekly_df.empty else None
     n_buses_hit = int((weekly_df["violation_hours_week"] > 0).sum())
     peak_week_kw = float(week_loads.sum(axis=0).max()) if week_loads.size else 0.0
 
-    st.markdown(f"### Week of {ws.strftime('%a %b %d, %Y')} · {scenario_for_planner}")
+    range_str = (
+        f"{from_date.strftime('%a %b %d, %Y')} → {to_date.strftime('%a %b %d, %Y')} "
+        f"({n_days} day{'s' if n_days != 1 else ''})"
+    )
+    st.markdown(f"### {range_str} · {scenario_for_planner}")
 
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("Total voltage violations", f"{total_v}")
@@ -1845,10 +1885,10 @@ def render_planner_view():
     ])
 
     with tab_hm:
-        day_dates = pd.date_range(ws, periods=n_days, freq="D")
+        day_dates = pd.date_range(from_date, periods=n_days, freq="D")
         st.plotly_chart(violation_heatmap(hours_matrix, day_dates), width="stretch")
         st.caption(
-            "Daily voltage-violation hours per bus across the selected week. "
+            "Daily voltage-violation hours per bus across the selected range. "
             "Top 20 most-stressed buses shown — empty cells mean the bus was inside the "
             "[0.95, 1.05] pu band that day."
         )
@@ -1872,8 +1912,9 @@ def render_planner_view():
     with tab_trend:
         st.plotly_chart(weekly_trend_chart(trend_df), width="stretch")
         st.caption(
-            "Selected week shows the actual computed violation count from the OpenDSS solve; "
-            "other weeks show heat-stress hours per week as a proxy for the full season."
+            "Each bar is one summer week from the dataset, showing heat-stress hours per "
+            "week as a proxy for stress evolution across the season — independent of "
+            "the date range you picked above."
         )
 
     with tab_capex:
