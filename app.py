@@ -1256,6 +1256,20 @@ def render_operator_view():
                                      min_value=all_days[24], max_value=all_days[-2])
         with cc2:
             pick_hour = st.slider("Start hour", 0, 23, 6)
+
+        # Dataset only covers Phoenix summers (Jun-Aug per year). If the user
+        # picks a date outside that coverage (e.g. April), snap to the nearest
+        # in-data date and TELL them — instead of silently using June 1.
+        if pick_day not in set(all_days):
+            candidates_after  = [d for d in all_days if d >= pick_day]
+            candidates_before = [d for d in all_days if d <= pick_day]
+            snapped = candidates_after[0] if candidates_after else candidates_before[-1]
+            st.info(
+                f"Dataset only covers Phoenix summers (Jun-Aug). Snapped your pick "
+                f"of **{pick_day}** to the nearest available date: **{snapped}**."
+            )
+            pick_day = snapped
+
         scenario_label = f"Custom · {pick_day} {pick_hour:02d}:00"
     else:
         scenario_ts = scenarios[pick_scenario]
