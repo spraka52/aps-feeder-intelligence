@@ -1459,16 +1459,6 @@ def render_operator_view():
             width="stretch",
         )
 
-        # Weather drivers — surface the NOAA + NSRDB inputs the model is using.
-        win_start = t0 + forecaster.horizon_in
-        win_end   = t0 + forecaster.horizon_in + forecaster.horizon_out
-        temp_in_window = ds_base.temp[win_start:win_end]
-        ghi_in_window  = ds_base.ghi[win_start:win_end]
-        st.plotly_chart(
-            weather_drivers_chart(fcst_times, temp_in_window, ghi_in_window),
-            width="stretch",
-        )
-
         cf1, cf2 = st.columns(2)
         with cf1:
             st.plotly_chart(violations_chart(res_base, res_stress, fcst_times), width="stretch")
@@ -1562,7 +1552,11 @@ def render_operator_view():
             "outputs. Useful for engineering deep-dives — not the primary "
             "deliverable surface."
         )
-        adv_a, adv_b = st.tabs(["Forecast uncertainty (MC dropout)", "Per-phase voltages"])
+        adv_a, adv_b, adv_c = st.tabs([
+            "Forecast uncertainty (MC dropout)",
+            "Per-phase voltages",
+            "Weather drivers (NOAA + NSRDB)",
+        ])
 
         with adv_a:
             st.markdown(
@@ -1650,6 +1644,24 @@ def render_operator_view():
                 f"{fcst_times[worst_h].strftime('%a %b %d · %H:%M')}"
             )
             scrollable_table(phase_df, max_height=480)
+
+        with adv_c:
+            st.markdown(
+                "The two real Phoenix data sources driving the load model "
+                "across the same 24-hour forecast horizon. Temperature comes "
+                "from **NOAA NCEI ISD-Lite** at Phoenix Sky Harbor (KPHX); "
+                "irradiance from **NREL NSRDB** GOES Aggregated PSM v4.0.0. "
+                "Both feeds are pre-cached as Parquet under `data/noaa_cache/` "
+                "and `data/nsrdb_cache/` so cold deploys work without API keys."
+            )
+            win_start = t0 + forecaster.horizon_in
+            win_end   = t0 + forecaster.horizon_in + forecaster.horizon_out
+            temp_in_window = ds_base.temp[win_start:win_end]
+            ghi_in_window  = ds_base.ghi[win_start:win_end]
+            st.plotly_chart(
+                weather_drivers_chart(fcst_times, temp_in_window, ghi_in_window),
+                width="stretch",
+            )
 
 
 # =============================================================================
