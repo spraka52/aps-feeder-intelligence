@@ -1712,18 +1712,20 @@ def render_planner_view():
     with cw2:
         scenario_for_planner = st.radio(
             "Scenario",
-            ["Today's mix (10% PV)", "2030 stress (heat + 35% EV + 10% PV)"],
+            ["Baseline", "Stress · +35% EV overlay, +8 kW PV/bus"],
             index=1, horizontal=True,
-            help="'Today's mix' is the present feeder with existing 10% PV penetration and no EV uptake. "
-                 "'2030 stress' adds 35% residential EV at evening peak.",
+            help="**Baseline**: real Phoenix load (NOAA + NSRDB + ResStock + ComStock) "
+                 "with no EV overlay and no behind-meter PV.  \n"
+                 "**Stress**: same baseline + 35% nominal-kW EV evening overlay "
+                 "+ 8 kW per bus of behind-meter PV nameplate.",
         )
 
     week_idx = week_labels.index(pick_week_label)
     ws, we = weeks[week_idx]
 
-    is_stress = "stress" in scenario_for_planner.lower() or "2030" in scenario_for_planner
+    is_stress = "stress" in scenario_for_planner.lower()
 
-    # EV slider — interpolates between today's mix (0% EV) and 2030 stress (35% EV)
+    # EV slider — interpolates between baseline (0% EV) and stress (35% EV)
     ev_options = [0, 10, 20, 35, 50, 60]
     default_ev = 35 if is_stress else 0
     planner_ev_pct = st.select_slider(
@@ -1732,7 +1734,7 @@ def render_planner_view():
         help="Adds an EV charging overlay equal to this percentage of each "
              "bus's nominal kW at evening peak. **Not the percentage of "
              "customers with EVs.** Set above 35% to extrapolate beyond "
-             "the 2030 stress preset.",
+             "the stress preset.",
     )
 
     week_mask_base = (ds_base.times >= ws) & (ds_base.times <= we)
