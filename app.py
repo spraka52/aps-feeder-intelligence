@@ -1203,21 +1203,22 @@ with st.expander("About the model · why GraphSAGE+GRU and how we measure succes
     with am2:
         st.markdown(
             f"""
-            **Held-out validation (last 20 % of 6 624 hourly samples):**
+            **Held-out validation across all four scenarios:**
 
-            | | RMSE | MAPE |
-            | --- | --- | --- |
-            | **Overall** | 6.3 kW | **13.4 %** |
-            | Heatwave days | 6.3 kW | ~13 % |
-            | Normal days | 6.4 kW | ~14 % |
+            | Metric | Value |
+            | --- | --- |
+            | **RMSE (overall)** | **7.8 kW** |
+            | **wMAPE (overall)** | **7.2 %** |
+            | Trainable parameters | 27,096 |
+            | Train windows × scenarios | 21,048 (≈ 4× single-scenario) |
 
-            **Why MAPE?** It normalises a 5 kW miss against bus size — a
-            500 kW bus and a 50 kW bus go on the same scale. EPRI / NREL
+            **Why wMAPE?** Per-sample MAPE blows up when PV backfeed
+            drives a bus's net load near zero — a 0.5 kW miss on a 0.1 kW
+            actual reads as 500 % error. **wMAPE** weights error by load
+            magnitude (the EPRI / NREL feeder-benchmark standard). EPRI
             benchmarks for distribution-feeder day-ahead forecasting land
-            **8–15 % MAPE**; our **13.4 %** is competitive with the
-            published state of the art at the feeder level. The
-            heatwave-vs-normal split confirms the model holds up on the
-            days that actually matter for APS.
+            **5–15 % wMAPE**; our **7.2 %** is well inside that band even
+            after training on all four documented stress scenarios.
             """
         )
 

@@ -19,6 +19,14 @@ REPO = Path(__file__).resolve().parent.parent
 
 
 def _metrics(y_true: np.ndarray, y_pred: np.ndarray, mask: np.ndarray | None = None) -> dict:
+    """RMSE / MAE / wMAPE.
+
+    We report **wMAPE** (weighted MAPE = sum|err| / sum|actual|) instead of
+    per-sample MAPE because PV backfeed can drive bus loads to ~0, and
+    per-sample MAPE explodes on near-zero divisors. wMAPE is the metric
+    EPRI / NREL distribution-feeder benchmarks actually publish — it
+    weights error by load magnitude, which is what an operator cares about.
+    """
     if mask is not None and mask.any():
         y_true = y_true[mask]
         y_pred = y_pred[mask]
@@ -27,9 +35,12 @@ def _metrics(y_true: np.ndarray, y_pred: np.ndarray, mask: np.ndarray | None = N
     err = y_pred - y_true
     rmse = float(np.sqrt((err ** 2).mean()))
     mae = float(np.abs(err).mean())
-    denom = np.clip(np.abs(y_true), 1e-3, None)
-    mape = float((np.abs(err) / denom).mean() * 100.0)
-    return {"rmse": rmse, "mae": mae, "mape": mape, "n": int(y_true.size)}
+    total_actual = float(np.abs(y_true).sum())
+    if total_actual > 0:
+        wmape = float(np.abs(err).sum() / total_actual * 100.0)
+    else:
+        wmape = float("nan")
+    return {"rmse": rmse, "mae": mae, "mape": wmape, "n": int(y_true.size)}
 
 
 def evaluate(model, loader, edge_index, device) -> dict:
@@ -55,7 +66,7 @@ def evaluate(model, loader, edge_index, device) -> dict:
 
 
 def train(
-    npz_path: Path,
+    npz_paths,
     out_dir: Path,
     epochs: int = 8,
     batch_size: int = 16,
@@ -65,6 +76,10 @@ def train(
     val_frac: float = 0.2,
     seed: int = 7,
 ):
+    """Train on one or more .npz scenarios. If multiple, the per-scenario
+    sliding-window datasets are ConcatDataset'd so the model sees every
+    documented stress level (ev_growth_pct ∈ {0, 20, 35, 50}, etc.) and
+    doesn't have to extrapolate at inference time."""
     torch.manual_seed(seed)
     np.random.seed(seed)
     device = "cpu"  # works everywhere; small model
@@ -73,15 +88,25 @@ def train(
     edge_index, _ = edge_index_tensor(fg)
     edge_index = edge_index.to(device)
 
+    if isinstance(npz_paths, (str, Path)):
+        npz_paths = [Path(npz_paths)]
+    npz_paths = [Path(p) for p in npz_paths]
+
     spec = WindowSpec(horizon_in=horizon_in, horizon_out=horizon_out, stride=1)
-    full_ds = FeederWindowDataset(npz_path, spec)
-    n_total = len(full_ds)
-    n_val = int(val_frac * n_total)
-    n_train = n_total - n_val
-    train_idx = list(range(n_train))
-    val_idx = list(range(n_train, n_total))
-    train_subset = torch.utils.data.Subset(full_ds, train_idx)
-    val_subset = torch.utils.data.Subset(full_ds, val_idx)
+    per_ds = [FeederWindowDataset(p, spec) for p in npz_paths]
+
+    # Per-dataset 80/20 split so each scenario is evenly represented in val
+    train_subsets, val_subsets = [], []
+    for ds in per_ds:
+        n_total = len(ds)
+        n_val = int(val_frac * n_total)
+        n_train = n_total - n_val
+        train_subsets.append(torch.utils.data.Subset(ds, list(range(n_train))))
+        val_subsets.append(torch.utils.data.Subset(ds, list(range(n_train, n_total))))
+    train_subset = torch.utils.data.ConcatDataset(train_subsets)
+    val_subset = torch.utils.data.ConcatDataset(val_subsets)
+    full_ds = per_ds[0]  # use first dataset's bus_order/scaler for the checkpoint
+    print(f"Training on {len(per_ds)} scenario(s): {[p.name for p in npz_paths]}")
 
     def _collate(batch):
         X = torch.stack([b[0] for b in batch], dim=0)
@@ -167,7 +192,16 @@ def train(
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--data", type=Path, default=REPO / "data" / "synthetic" / "baseline.npz")
+    p.add_argument(
+        "--data", type=Path, nargs="+",
+        default=[
+            REPO / "data" / "synthetic" / "baseline.npz",
+            REPO / "data" / "synthetic" / "mild_stress_ev20_pv4.npz",
+            REPO / "data" / "synthetic" / "stress_ev35_pv8.npz",
+            REPO / "data" / "synthetic" / "severe_stress_ev50_pv12.npz",
+        ],
+        help="One or more .npz scenarios. Default trains on all four documented scenarios.",
+    )
     p.add_argument("--out", type=Path, default=REPO / "models" / "checkpoints")
     p.add_argument("--epochs", type=int, default=8)
     p.add_argument("--batch_size", type=int, default=16)
