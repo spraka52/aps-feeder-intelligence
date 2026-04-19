@@ -1132,7 +1132,7 @@ years_available = sorted({t.year for t in times})
 
 role = st.radio(
     "Role",
-    ["Operator · hour-by-hour", "Planner · week-by-week"],
+    ["APS Operator", "APS Planner"],
     horizontal=True,
     label_visibility="collapsed",
 )
@@ -2153,7 +2153,7 @@ def _render_planner_action_card(a):
 
 
 # Render
-if role.startswith("Operator"):
+if "Operator" in role:
     render_operator_view()
 else:
     render_planner_view()
