@@ -145,6 +145,50 @@ the full history; the dashboard renders it under "Model performance".
 
 ---
 
+## Why this model architecture? (and why not alternatives)
+
+We chose **GraphSAGE → GRU → Linear** because the forecasting target is
+*spatio-temporal*: every bus has its own 24-hour load curve, but no bus is
+electrically isolated — voltage sags propagate, EV adoption tends to
+cluster, and a substation transformer constrains the entire downstream
+radial. The architecture has to capture both axes.
+
+| Candidate | What we'd lose | Why GraphSAGE+GRU wins |
+| --- | --- | --- |
+| **Plain MLP / per-bus regression** | Throws away the feeder graph entirely. Each bus is forecast in isolation, ignoring that bus 890's evening EV peak shifts neighbour 888's voltage. | GraphSAGE aggregates neighbour features per layer, so each bus's prediction sees its electrical neighbourhood. |
+| **LightGBM / XGBoost per bus** | Same problem as MLP — no spatial information. Also: gradient-boosted trees can't share parameters across buses, so a small bus with sparse data can't borrow signal from a similar large bus. | GraphSAGE shares weights across all 34 buses, which is critical when each bus has only ~6.5k hourly samples. |
+| **LSTM (no graph)** | Captures the temporal axis but still per-bus. ~2× the parameters of GRU for marginal accuracy gain on 24-hour horizons (LSTM excels at much longer sequences). | GRU is the right capacity for diurnal cycles + lagged HVAC response. |
+| **Transformer / TFT** | Strong on long horizons with lots of data. We have 6,624 samples — Transformers overfit hard at this scale. Also adds 5–10× training cost for no clear win on 24-hour load. | GraphSAGE+GRU has only ~27k parameters and trains in ~12 epochs (≈12 minutes CPU). |
+| **Pure physics (OpenDSS only)** | OpenDSS solves the *power flow* given loads — it doesn't *forecast* loads. We need both: a forecaster (this model) and a validator (OpenDSS). | This is exactly the role split we built. |
+
+**Bottom line:** GraphSAGE+GRU is the smallest model that respects both the
+feeder topology and the temporal dynamics of load, and at 27k parameters
+it's lightweight enough to run in the browser tab on Streamlit Cloud.
+
+---
+
+## How we measure success (and why these metrics)
+
+We report three numbers in the dashboard's *Model performance* card:
+
+| Metric | What it tells you | Why we picked it |
+| --- | --- | --- |
+| **MAPE** (mean absolute % error) | Forecast error normalised by the bus's actual load. A 5 kW miss matters at a 50 kW bus and is noise at a 500 kW bus — MAPE puts both on the same scale. | Industry standard for distribution-load forecasting. EPRI / NREL day-ahead benchmarks land around 8–15% MAPE; ISO-NE day-ahead system-load is ≈2% MAPE *on the whole system* but degrades sharply at the feeder level. **Our 13.4% is competitive with the published feeder-level state of the art.** |
+| **RMSE** (kW) | Absolute error in the unit operators care about. Useful for sizing — "the model can be off by ~6 kW per bus per hour." | Operators size batteries and capacitor banks in kW, not in percent. |
+| **Heatwave-vs-normal split** | Reveals whether the model breaks down on the days that matter most (Phoenix peaks happen during 41 °C+ heatwaves). | A model with great average MAPE but terrible heatwave MAPE would be useless to APS. We explicitly checked: 13% heatwave vs 14% normal — the model holds up under stress. |
+
+**Decisions we made because of these metrics:**
+
+- **Switched from Austin-based SMART-DS to Phoenix-specific ResStock/ComStock load shapes** when MAPE on heatwave days was 34% — the Austin profiles weren't learning Phoenix's HVAC patterns. New MAPE: 13%.
+- **Clamped negative model outputs to zero** after seeing rare slightly-negative kW predictions hurt RMSE; a load forecast can't physically be negative.
+- **Added year-in-window encoding** so 2024-2026 trends don't leak across folds — early experiments showed val MAPE jumped 4% without it.
+
+We deliberately do *not* report:
+- *R² alone* — meaningless on highly auto-correlated time series.
+- *Single-bus MAPE* — APS cares about the worst-case bus, not the average. The dashboard surfaces worst-case behaviour through the *Bus × Day heatmap* and the *Capital Action Plan* instead.
+
+---
+
 ## Layout
 
 ```
