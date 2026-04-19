@@ -11,6 +11,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import pydeck as pdk
 import streamlit as st
+import streamlit.components.v1 as components
 
 from data.synthesize import load_dataset
 from data.topology import COORDS, SPOT_LOADS_KW, build_graph
@@ -250,53 +251,74 @@ def status_pill(label: str, kind: str = "ok") -> str:
 
 # Streamlit's st.dataframe doesn't expose a reliable horizontal-scroll knob —
 # wide tables get squeezed and long descriptions get truncated mid-cell. Render
-# as a real HTML <table> wrapped in an overflow:auto div so users get both
-# horizontal AND vertical scroll, plus full text in every cell.
+# as a real HTML <table> wrapped in an overflow:auto div, sandboxed inside a
+# components.v1.html iframe so the markdown sanitiser doesn't strip styling.
 def scrollable_table(df: pd.DataFrame, max_height: int = 460):
     if df.empty:
         return
     df_safe = df.copy()
     for col in df_safe.columns:
         df_safe[col] = df_safe[col].astype(str)
-    html = df_safe.to_html(index=False, classes="aps-table", border=0, escape=True)
-    html = html.replace("<thead>", "<thead class='aps-thead'>")
-    css = f"""
-    <style>
-    .aps-scroll {{
-      overflow-x: auto; overflow-y: auto;
-      max-height: {max_height}px;
-      border: 1px solid {COLOR['border']};
-      border-radius: 4px;
-      background: rgba(20, 24, 32, 0.30);
-    }}
-    .aps-table {{
-      width: max-content; min-width: 100%;
-      border-collapse: collapse;
-      font-family: -apple-system, system-ui, "Inter", Helvetica, Arial, sans-serif;
-      font-size: 0.86rem;
-      font-feature-settings: "tnum" 1;
-      color: {COLOR['text']};
-    }}
-    .aps-table th, .aps-table td {{
-      padding: 8px 14px;
-      border-bottom: 1px solid rgba(180,190,200,0.10);
-      text-align: left;
-      white-space: nowrap;
-      vertical-align: top;
-    }}
-    .aps-thead th {{
-      background: rgba(70,80,100,0.28);
-      color: {COLOR['text_dim']};
-      font-weight: 500;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
-      font-size: 0.72rem;
-      position: sticky; top: 0; z-index: 2;
-    }}
-    .aps-table tr:hover td {{ background: rgba(255,255,255,0.04); }}
-    </style>
+    table_html = df_safe.to_html(index=False, classes="aps-table",
+                                 border=0, escape=True)
+    table_html = table_html.replace("<thead>", "<thead class='aps-thead'>")
+    full_html = f"""
+    <!doctype html>
+    <html>
+      <head>
+        <meta charset="utf-8" />
+        <style>
+          html, body {{
+            margin: 0; padding: 0;
+            background: transparent;
+            color: {COLOR['text']};
+            font-family: -apple-system, system-ui, "Inter", Helvetica, Arial, sans-serif;
+          }}
+          .aps-scroll {{
+            overflow-x: auto; overflow-y: auto;
+            max-height: {max_height}px;
+            border: 1px solid {COLOR['border']};
+            border-radius: 4px;
+            background: rgba(20, 24, 32, 0.55);
+          }}
+          .aps-scroll::-webkit-scrollbar {{ height: 10px; width: 10px; }}
+          .aps-scroll::-webkit-scrollbar-thumb {{
+            background: rgba(180,190,200,0.25); border-radius: 5px;
+          }}
+          .aps-scroll::-webkit-scrollbar-track {{ background: transparent; }}
+          .aps-table {{
+            width: max-content; min-width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+            font-feature-settings: "tnum" 1;
+            color: {COLOR['text']};
+          }}
+          .aps-table th, .aps-table td {{
+            padding: 9px 14px;
+            border-bottom: 1px solid rgba(180,190,200,0.10);
+            text-align: left;
+            white-space: nowrap;
+            vertical-align: top;
+          }}
+          .aps-thead th {{
+            background: rgba(70,80,100,0.45);
+            color: {COLOR['text_dim']};
+            font-weight: 500;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            font-size: 11px;
+            position: sticky; top: 0; z-index: 2;
+          }}
+          .aps-table tbody tr:hover td {{ background: rgba(255,255,255,0.04); }}
+          .aps-table tbody tr:nth-child(even) td {{ background: rgba(255,255,255,0.015); }}
+        </style>
+      </head>
+      <body>
+        <div class="aps-scroll">{table_html}</div>
+      </body>
+    </html>
     """
-    st.markdown(css + f'<div class="aps-scroll">{html}</div>', unsafe_allow_html=True)
+    components.html(full_html, height=max_height + 12, scrolling=False)
 
 
 # --- Plotly defaults ------------------------------------------------------ #
