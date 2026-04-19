@@ -979,6 +979,20 @@ forecaster = _get_forecaster(ckpt_sig[0])
 ds_base = _get_dataset(str(BASELINE_NPZ), *base_sig)
 ds_stress = _get_dataset(str(STRESS_NPZ), *stress_sig)
 
+# The .npz datasets store timestamps as naive datetime64 in UTC (NOAA ISD-Lite
+# is published in UTC). For display we want America/Phoenix (UTC-7, no DST) so
+# the load chart's "evening peak" lines up with the temperature peak at ~5 PM
+# instead of being shown at "00:00" UTC. This re-tags the time index in place
+# on both datasets — the underlying load arrays don't change, only how the
+# index labels are rendered.
+def _to_phoenix(idx: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    if idx.tz is None:
+        return idx.tz_localize("UTC").tz_convert("America/Phoenix")
+    return idx.tz_convert("America/Phoenix")
+
+ds_base.times = _to_phoenix(ds_base.times)
+ds_stress.times = _to_phoenix(ds_stress.times)
+
 times = ds_base.times
 all_days = sorted({t.date() for t in times})
 years_available = sorted({t.year for t in times})
