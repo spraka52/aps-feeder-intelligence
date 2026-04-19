@@ -893,14 +893,8 @@ st.set_page_config(
 if "dark_mode" not in st.session_state:
     st.session_state.dark_mode = False
 
-# Render toggle in a top-right strip via columns
-_tog_l, _tog_r = st.columns([10, 1])
-with _tog_r:
-    st.session_state.dark_mode = st.toggle(
-        "Dark", value=st.session_state.dark_mode,
-        help="Switch between light (utility-control-center) and dark (SCADA-night) themes.",
-    )
-
+# Toggle is wired into the header row below — read its session-state value here
+# so the rest of the module sees the right COLOR palette.
 DARK = bool(st.session_state.dark_mode)
 COLOR = get_palette(DARK)
 
@@ -1017,8 +1011,8 @@ st.markdown(
         padding: 0 0 0.4rem 0;
     }}
     .brand {{
-        font-size: 1.45rem; font-weight: 700; color: {COLOR['text']};
-        letter-spacing: -0.01em;
+        font-size: 2.05rem; font-weight: 700; color: {COLOR['text']};
+        letter-spacing: -0.015em; line-height: 1.15;
     }}
     .brand-tag {{
         margin-left: 12px; padding: 3px 9px; border: 1px solid {COLOR['accent']};
@@ -1137,15 +1131,13 @@ st.markdown(
 # --- Top header ---------------------------------------------------------- #
 
 st.markdown('<div class="top-rule"></div>', unsafe_allow_html=True)
-nav_l, nav_r = st.columns([8, 2])
-with nav_l:
+hdr_brand, hdr_tog, hdr_src = st.columns([8, 1.4, 1.2])
+with hdr_brand:
     st.markdown(
         f"""
-        <div class='nav-bar'>
-          <div>
-            <span class='brand'>APS Feeder Intelligence</span>
-            <span class='brand-tag'>Distribution operations</span>
-          </div>
+        <div style='padding-top:0.1rem;'>
+          <span class='brand'>APS Feeder Intelligence</span>
+          <span class='brand-tag' style='vertical-align: middle;'>Distribution operations</span>
         </div>
         <div class='subtitle'>
           Spatio-temporal forecasting · OpenDSS QSTS validation · advisory decision layer
@@ -1153,15 +1145,23 @@ with nav_l:
         """,
         unsafe_allow_html=True,
     )
-with nav_r:
+with hdr_tog:
+    st.markdown("<div style='padding-top:0.5rem;'></div>", unsafe_allow_html=True)
+    st.session_state.dark_mode = st.toggle(
+        "Dark mode",
+        value=st.session_state.dark_mode,
+        help="Switch between light (utility-control-center) and dark (SCADA-night) themes.",
+    )
+with hdr_src:
     st.markdown(
         f"""
-        <div style='text-align:right; padding-top:0.4rem;'>
+        <div style='text-align:right; padding-top:0.6rem;'>
           <a href='https://github.com/spraka52/aps-feeder-intelligence'
-             style='text-decoration:none; padding:5px 12px;
-                    border:1px solid {COLOR['border']}; border-radius:3px;
+             style='text-decoration:none; padding:6px 14px;
+                    border:1px solid {COLOR['border']}; border-radius:4px;
                     font-size:0.78rem; color:{COLOR['text_dim']};
-                    letter-spacing:0.06em; text-transform:uppercase;'>
+                    letter-spacing:0.06em; text-transform:uppercase;
+                    background:{COLOR['bg_card']};'>
             View source
           </a>
         </div>
