@@ -1041,7 +1041,15 @@ def render_operator_view():
         scrollable_table(timeline_df, max_height=620)
 
     with tab_actions:
-        show_n = st.slider("Top N actions", 3, 15, 8)
+        n_options = [3, 5, 8, 10, 12, 15, 20]
+        cnsel, _ = st.columns([1, 5])
+        with cnsel:
+            show_n = st.selectbox(
+                "Top N actions",
+                options=n_options,
+                index=n_options.index(8),
+                help="How many top-priority actions to show in the table below.",
+            )
         sub_stress, sub_base = st.tabs(["Stress scenario", "Baseline scenario"])
 
         def _render(actions_list, label, picker_key: str):
