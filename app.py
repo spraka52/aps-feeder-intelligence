@@ -982,14 +982,17 @@ def render_operator_view():
     # ---- EV adoption slider (interpolates between baseline and stress) ---- #
     ev_options = [0, 10, 20, 35, 50, 60]
     ev_pct = st.select_slider(
-        "EV adoption on this feeder (%)",
+        "EV evening-peak overlay (% of bus nominal)",
         options=ev_options, value=35,
-        help="Linearly interpolates load between today's baseline (0%) and "
-             "the 2030 stress scenario (35% EV). Above 35% extrapolates "
-             "beyond the dataset's training range.",
+        help="Adds an EV charging overlay equal to this percentage of each "
+             "bus's nominal kW at evening peak. **Not the percentage of "
+             "customers with EVs** — for residential context, ~10% overlay "
+             "roughly maps to ~35% household EV ownership. 0% = no EV; "
+             "35% = the stress preset; >35% extrapolates beyond training data.",
     )
-    ev_label = ("Today's load (no EV)" if ev_pct == 0 else
-                "2030 stress" if ev_pct == 35 else f"Custom · {ev_pct}% EV")
+    ev_label = ("No EV overlay" if ev_pct == 0 else
+                "Stress preset (35% overlay)" if ev_pct == 35 else
+                f"Custom · {ev_pct}% nominal-kW overlay")
 
     st.markdown(
         f"<div class='scenario-banner'>"
@@ -1042,46 +1045,6 @@ def render_operator_view():
             action_kw = -abs(action_kw)
         else:
             action_kw = abs(action_kw)
-
-        # ---- Phase imbalance detector ---- #
-        phase_block = ""
-        if action_bus.isdigit():
-            # Find the hour where this bus's voltage is most extreme
-            v_per_hour = [r.bus_voltage_pu.get(action_bus) for r in res_stress]
-            v_clean = [(h, v) for h, v in enumerate(v_per_hour) if v is not None]
-            if v_clean:
-                if "overvoltage" in action_kind.lower():
-                    worst_h = max(v_clean, key=lambda x: x[1])[0]
-                else:
-                    worst_h = min(v_clean, key=lambda x: x[1])[0]
-                phases_raw = res_stress[worst_h].bus_voltage_per_phase.get(action_bus, [])
-                phases = [v for v in phases_raw if v is not None and not (isinstance(v, float) and np.isnan(v))]
-                if len(phases) >= 2:
-                    avg = float(np.mean(phases))
-                    max_dev = max(abs(v - avg) for v in phases)
-                    imb_pct = (max_dev / avg) * 100.0 if avg > 0 else 0.0
-                    is_imbalanced = imb_pct > 2.0
-                    diag_color = COLOR["warn"] if is_imbalanced else COLOR["ok"]
-                    diag_label = ("Phase imbalance > 2 % — re-balance loads first"
-                                  if is_imbalanced else
-                                  "Three phases tracking together (< 2 % spread)")
-                    phase_str = "  ·  ".join(
-                        f"{name}={v:.3f}" for name, v in zip(["Va", "Vb", "Vc"], phases)
-                    )
-                    phase_block = (
-                        f"<div style='margin-top:14px; padding:10px 14px; "
-                        f"background:#FFFFFF; border:1px solid {COLOR['border']}; "
-                        f"border-left:3px solid {diag_color}; border-radius:3px;'>"
-                        f"<div style='font-size:0.72rem; color:{COLOR['text_dim']}; "
-                        f"text-transform:uppercase; letter-spacing:0.06em; font-weight:600; margin-bottom:6px;'>"
-                        f"Phase voltages at worst hour · Bus {action_bus}</div>"
-                        f"<div style='font-size:0.92rem; color:{COLOR['text']}; font-feature-settings:\"tnum\" 1;'>"
-                        f"{phase_str} pu  &nbsp;·&nbsp; "
-                        f"imbalance <b>{imb_pct:.1f} %</b></div>"
-                        f"<div style='font-size:0.82rem; color:{diag_color}; "
-                        f"font-weight:600; margin-top:4px;'>{diag_label}</div>"
-                        f"</div>"
-                    )
 
         cf_block = ""
         if action_kw != 0.0 and action_bus.isdigit():
@@ -1144,7 +1107,6 @@ def render_operator_view():
                 {int(top['hours_affected'])} hours affected ·
                 severity {float(top['severity']):.2f}
               </div>
-              {phase_block}
               {cf_block}
             </div>
             """,
@@ -1176,8 +1138,9 @@ def render_operator_view():
     st.markdown("")
 
     # Tabs
-    tab_map, tab_forecast, tab_timeline, tab_actions = st.tabs([
-        "Operations Map", "Forecast & Physics", "Hourly Action Timeline", "Action Center",
+    tab_map, tab_forecast, tab_timeline, tab_actions, tab_adv = st.tabs([
+        "Operations Map", "Forecast & Physics", "Hourly Action Timeline",
+        "Action Center", "Advanced",
     ])
 
     with tab_map:
@@ -1231,41 +1194,10 @@ def render_operator_view():
             )
 
     with tab_forecast:
-        show_ci = st.toggle(
-            "Show forecast uncertainty (80 % CI via Monte-Carlo dropout)",
-            value=False,
-            help="Runs the model 20× with dropout enabled and shades the "
-                 "P10–P90 band. Adds ~1 s to the render. A planner sizing "
-                 "infrastructure should look at the upper band, not the median.",
-        )
-        p10_s = p90_s = None
-        if show_ci:
-            try:
-                _mean, p10_s, p90_s = forecaster.forecast_window_with_uncertainty(
-                    ds_stress, t0, n_samples=20,
-                )
-                # Apply the same EV interpolation to the bands
-                p10_s = interpolate_loads(fcst_base_raw, p10_s, ev_pct)
-                p90_s = interpolate_loads(fcst_base_raw, p90_s, ev_pct)
-            except Exception as e:
-                st.warning(f"Uncertainty computation failed: {e}")
-
         st.plotly_chart(
-            horizon_chart(fcst_base, fcst_stress, fcst_times, p10_s, p90_s),
+            horizon_chart(fcst_base, fcst_stress, fcst_times),
             width="stretch",
         )
-        if show_ci and p10_s is not None and p90_s is not None:
-            peak_p50 = float(fcst_stress.sum(axis=1).max())
-            peak_p10 = float(p10_s.sum(axis=1).max())
-            peak_p90 = float(p90_s.sum(axis=1).max())
-            band = (peak_p90 - peak_p10) / max(peak_p50, 1.0) * 100.0
-            st.caption(
-                f"**Peak feeder forecast:** {peak_p50:.0f} kW (median)  ·  "
-                f"P10 {peak_p10:.0f} kW  ·  P90 {peak_p90:.0f} kW  ·  "
-                f"band ≈ {band:.0f} % of median. Size infrastructure to P90 "
-                f"unless you have a clear over-build cost reason not to."
-            )
-
         cf1, cf2 = st.columns(2)
         with cf1:
             st.plotly_chart(violations_chart(res_base, res_stress, fcst_times), width="stretch")
@@ -1353,6 +1285,101 @@ def render_operator_view():
         with sub_base:
             _render(actions_base, "baseline", picker_key="op_actions_base")
 
+    with tab_adv:
+        st.caption(
+            "Diagnostic views beyond the core forecast / scenario / decision "
+            "outputs. Useful for engineering deep-dives — not the primary "
+            "deliverable surface."
+        )
+        adv_a, adv_b = st.tabs(["Forecast uncertainty (MC dropout)", "Per-phase voltages"])
+
+        with adv_a:
+            st.markdown(
+                "Runs the GraphSAGE+GRU forecaster 20× with dropout layers "
+                "active and emits the empirical P10 / P90 envelope around the "
+                "median forecast (Gal & Ghahramani 2016, *Dropout as a "
+                "Bayesian Approximation*). A planner sizing infrastructure "
+                "should look at the upper band, not the median."
+            )
+            try:
+                _mean, p10_s, p90_s = forecaster.forecast_window_with_uncertainty(
+                    ds_stress, t0, n_samples=20,
+                )
+                p10_s = interpolate_loads(fcst_base_raw, p10_s, ev_pct)
+                p90_s = interpolate_loads(fcst_base_raw, p90_s, ev_pct)
+                st.plotly_chart(
+                    horizon_chart(fcst_base, fcst_stress, fcst_times, p10_s, p90_s),
+                    width="stretch",
+                )
+                peak_p50 = float(fcst_stress.sum(axis=1).max())
+                peak_p10 = float(p10_s.sum(axis=1).max())
+                peak_p90 = float(p90_s.sum(axis=1).max())
+                band = (peak_p90 - peak_p10) / max(peak_p50, 1.0) * 100.0
+                st.caption(
+                    f"**Peak feeder forecast:** {peak_p50:.0f} kW (median)  ·  "
+                    f"P10 {peak_p10:.0f} kW  ·  P90 {peak_p90:.0f} kW  ·  "
+                    f"band ≈ {band:.0f} % of median. Size infrastructure to "
+                    f"P90 unless you have a clear over-build cost reason not to."
+                )
+            except Exception as e:
+                st.warning(f"Uncertainty computation failed: {e}")
+
+        with adv_b:
+            st.markdown(
+                "OpenDSS emits per-phase voltages on each three-phase bus. "
+                "An overvoltage on phase A only often means *load imbalance* "
+                "(re-balance customers across phases) rather than a true "
+                "three-phase issue (Volt-VAR / cap bank). Phases with "
+                "imbalance > 2 % at the worst hour are flagged below."
+            )
+            # Pick worst hour for the highest-priority action's bus
+            if not df_stress_actions.empty:
+                action_bus = str(df_stress_actions.iloc[0]["bus_or_line"])
+                action_kind = str(df_stress_actions.iloc[0]["kind"])
+            else:
+                action_bus, action_kind = bus_order[0], "undervoltage"
+
+            # Build a table of per-phase voltages for *all* buses at the worst hour
+            v_per_hour = [r.bus_voltage_pu.get(action_bus) for r in res_stress]
+            v_clean = [(h, v) for h, v in enumerate(v_per_hour) if v is not None]
+            if v_clean:
+                if "overvoltage" in action_kind.lower():
+                    worst_h = max(v_clean, key=lambda x: x[1])[0]
+                else:
+                    worst_h = min(v_clean, key=lambda x: x[1])[0]
+            else:
+                worst_h = 0
+
+            phase_rows = []
+            for b in bus_order:
+                phases_raw = res_stress[worst_h].bus_voltage_per_phase.get(b, [])
+                phases = [float(v) if v is not None and not (isinstance(v, float) and np.isnan(v)) else None
+                          for v in phases_raw]
+                # Pad to 3
+                while len(phases) < 3:
+                    phases.append(None)
+                valid = [v for v in phases if v is not None]
+                if not valid:
+                    continue
+                avg = float(np.mean(valid))
+                max_dev = max(abs(v - avg) for v in valid) if len(valid) > 1 else 0.0
+                imb_pct = (max_dev / avg * 100.0) if avg > 0 else 0.0
+                phase_rows.append({
+                    "Bus": b,
+                    "Va (pu)": f"{phases[0]:.3f}" if phases[0] is not None else "—",
+                    "Vb (pu)": f"{phases[1]:.3f}" if phases[1] is not None else "—",
+                    "Vc (pu)": f"{phases[2]:.3f}" if phases[2] is not None else "—",
+                    "Avg (pu)": f"{avg:.3f}",
+                    "Imbalance (%)": f"{imb_pct:.1f}",
+                    "Flag": "Re-balance" if imb_pct > 2.0 else "OK",
+                })
+            phase_df = pd.DataFrame(phase_rows).sort_values("Imbalance (%)", ascending=False)
+            st.markdown(
+                f"**Worst hour for top-action Bus {action_bus}:** "
+                f"{fcst_times[worst_h].strftime('%a %b %d · %H:%M')}"
+            )
+            scrollable_table(phase_df, max_height=480)
+
 
 # =============================================================================
 #                              PLANNER VIEW
@@ -1424,10 +1451,12 @@ def render_planner_view():
     ev_options = [0, 10, 20, 35, 50, 60]
     default_ev = 35 if is_stress else 0
     planner_ev_pct = st.select_slider(
-        "EV adoption on this feeder (%)",
+        "EV evening-peak overlay (% of bus nominal)",
         options=ev_options, value=default_ev,
-        help="Set above 35% to project beyond the 2030 stress case. "
-             "Useful for 'what does the feeder look like at 50% EV in 2035?'",
+        help="Adds an EV charging overlay equal to this percentage of each "
+             "bus's nominal kW at evening peak. **Not the percentage of "
+             "customers with EVs.** Set above 35% to extrapolate beyond "
+             "the 2030 stress preset.",
     )
 
     week_mask_base = (ds_base.times >= ws) & (ds_base.times <= we)
@@ -1532,10 +1561,9 @@ def render_planner_view():
 
     st.markdown("")
 
-    tab_hm, tab_top, tab_trend, tab_hc, tab_ctg, tab_capex = st.tabs([
+    tab_hm, tab_top, tab_trend, tab_capex, tab_padv = st.tabs([
         "Bus × Day Heatmap", "Top Stressed Buses",
-        "Multi-Week Trend", "Hosting Capacity", "N-1 Contingency",
-        "Capital Action Plan",
+        "Multi-Week Trend", "Capital Action Plan", "Advanced",
     ])
 
     with tab_hm:
@@ -1569,127 +1597,6 @@ def render_planner_view():
             "Selected week shows the actual computed violation count from the OpenDSS solve; "
             "other weeks show heat-stress hours per week as a proxy for the full season."
         )
-
-    with tab_hc:
-        st.markdown(
-            "Per-bus PV **hosting headroom** — additional kW of solar a customer "
-            "could install at each bus before the bus voltage hits the 1.05 pu "
-            "limit. Required by the Arizona Corporation Commission as part of "
-            "every utility's annual hosting-capacity filing."
-        )
-        nominal_items = tuple(sorted(SPOT_LOADS_KW.items()))
-        hc_dict = _hosting_capacity(tuple(bus_order), nominal_items)
-        if not hc_dict:
-            st.warning("Hosting capacity solve did not converge.")
-        else:
-            # Replace inf with 5000 so the chart renders sensibly
-            hc_clean = {b: (5000.0 if v == float("inf") else float(v)) for b, v in hc_dict.items()}
-            df_hc = pd.DataFrame([
-                {"Bus": b, "Headroom (kW)": v, "Status": (
-                    "Constrained (< 100 kW)" if v < 100 else
-                    "Limited (100–500 kW)" if v < 500 else
-                    "Comfortable (500–1500 kW)" if v < 1500 else
-                    "Unbounded (regulator absorbs PV)"
-                )} for b, v in hc_clean.items()
-            ]).sort_values("Headroom (kW)").reset_index(drop=True)
-
-            color_map = {
-                "Constrained (< 100 kW)": COLOR["alert"],
-                "Limited (100–500 kW)": COLOR["stress"],
-                "Comfortable (500–1500 kW)": COLOR["accent"],
-                "Unbounded (regulator absorbs PV)": COLOR["ok"],
-            }
-            fig = go.Figure()
-            for status, sub in df_hc.groupby("Status", sort=False):
-                fig.add_trace(go.Bar(
-                    y=[f"Bus {b}" for b in sub["Bus"]],
-                    x=sub["Headroom (kW)"],
-                    orientation="h",
-                    name=status,
-                    marker_color=color_map.get(status, COLOR["neutral"]),
-                ))
-            layout = _layout("PV HOSTING HEADROOM PER BUS · TOWARD 1.05 PU LIMIT", height=620)
-            layout["margin"] = dict(l=20, r=20, t=44, b=80)
-            layout["yaxis"] = dict(autorange="reversed", tickfont=dict(size=11),
-                                   gridcolor="rgba(0,0,0,0)")
-            layout["barmode"] = "stack"
-            fig.update_layout(**layout)
-            fig.update_xaxes(title_text="kW additional PV before voltage hits 1.05 pu",
-                             title_font=dict(size=11, color=COLOR["text_dim"]))
-            st.plotly_chart(fig, width="stretch")
-            st.caption(
-                "Headroom is computed by injecting test PV (200 kW) at each bus, "
-                "measuring ΔV, and back-extrapolating to the 1.05 pu limit. "
-                "*Unbounded* buses are downstream of a voltage regulator that "
-                "absorbs the PV-induced voltage rise — they are the priority "
-                "interconnection candidates."
-            )
-
-    with tab_ctg:
-        st.markdown(
-            "**N-1 contingency** — re-solve OpenDSS with one element taken out "
-            "and compare violation counts to the in-service base case. This is "
-            "how planners decide whether a feeder needs redundant tie-switches "
-            "or whether a regulator is a single point of failure."
-        )
-        contingency_options = {
-            "Voltage regulator Reg1 (@ Bus 814)": "RegControl.Reg1",
-            "Voltage regulator Reg2 (@ Bus 852)": "RegControl.Reg2",
-            "In-line transformer 832 → 888": "Transformer.XFM_832_888",
-            "Long line 818 → 820 (longest 302-config segment)": "Line.L_818_820",
-            "Substation transformer (Sub)": "Transformer.Sub",
-        }
-        ctg_selected = st.multiselect(
-            "Elements to take out of service",
-            options=list(contingency_options.keys()),
-            default=[],
-            help="Select one or more elements. The OpenDSS deck is re-solved "
-                 "with each element disabled; results are compared to the base case.",
-        )
-        if not ctg_selected:
-            st.info("Pick at least one element above to run a contingency analysis.")
-        else:
-            disabled = tuple(contingency_options[k] for k in ctg_selected)
-            day_kw_flat = day_kw[0].astype(np.float32)  # use first day of week as representative
-            # Base case (no outage)
-            base_dicts = _solve(day_kw_flat.tobytes(), tuple(bus_order), day_kw_flat.shape)
-            ctg_dicts  = _solve_contingency(day_kw_flat.tobytes(), tuple(bus_order),
-                                            day_kw_flat.shape, disabled)
-            base_res = _to_hour_results(base_dicts)
-            ctg_res  = _to_hour_results(ctg_dicts)
-            n_v_base = sum(len(r.voltage_violations) for r in base_res)
-            n_v_ctg  = sum(len(r.voltage_violations) for r in ctg_res)
-            n_t_base = sum(len(r.thermal_overloads) for r in base_res)
-            n_t_ctg  = sum(len(r.thermal_overloads) for r in ctg_res)
-            worst_base = min((v for r in base_res for v in r.bus_voltage_pu.values()),
-                             default=float("nan"))
-            worst_ctg  = min((v for r in ctg_res for v in r.bus_voltage_pu.values()),
-                             default=float("nan"))
-
-            cc1, cc2, cc3 = st.columns(3)
-            cc1.metric("Voltage violations (24 hr)", n_v_ctg, f"{n_v_ctg - n_v_base:+d} vs base",
-                       delta_color="inverse")
-            cc2.metric("Thermal overloads (24 hr)", n_t_ctg, f"{n_t_ctg - n_t_base:+d} vs base",
-                       delta_color="inverse")
-            cc3.metric("Worst voltage (pu)", f"{worst_ctg:.3f}",
-                       f"{worst_ctg - worst_base:+.3f} vs base",
-                       delta_color="normal")
-            verdict_color = (COLOR["ok"] if n_v_ctg == n_v_base else
-                             COLOR["warn"] if n_v_ctg < n_v_base + 5 else COLOR["alert"])
-            verdict_text = (
-                "Feeder rides through this contingency without new violations." if n_v_ctg == n_v_base else
-                f"Contingency adds {n_v_ctg - n_v_base} violation hours — degraded but operable." if n_v_ctg < n_v_base + 10 else
-                f"Severe contingency: {n_v_ctg - n_v_base} new violation hours. "
-                f"Consider tie-switch / redundant regulator investment."
-            )
-            st.markdown(
-                f"<div style='margin-top:12px; padding:10px 14px; border-left:3px solid "
-                f"{verdict_color}; background:{COLOR['bg_card']}; border-radius:3px; "
-                f"font-size:0.92rem; color:{COLOR['text']};'>"
-                f"<b style='color:{verdict_color};'>Planner verdict:</b> {verdict_text}"
-                f"</div>",
-                unsafe_allow_html=True,
-            )
 
     with tab_capex:
         st.caption(
@@ -1740,6 +1647,133 @@ def render_planner_view():
         else:
             for a in plan_actions:
                 _render_planner_action_card(a)
+
+    with tab_padv:
+        st.caption(
+            "Engineering deep-dives that go beyond what the hackathon brief "
+            "asks for. **Hosting capacity** maps directly to the Arizona "
+            "Corporation Commission's annual filing requirement; **N-1 "
+            "contingency** justifies redundant-asset capex."
+        )
+        padv_a, padv_b = st.tabs(["Hosting Capacity", "N-1 Contingency"])
+
+        with padv_a:
+            st.markdown(
+                "Per-bus PV **hosting headroom** — additional kW of solar a customer "
+                "could install at each bus before the bus voltage hits the 1.05 pu "
+                "limit."
+            )
+            nominal_items = tuple(sorted(SPOT_LOADS_KW.items()))
+            hc_dict = _hosting_capacity(tuple(bus_order), nominal_items)
+            if not hc_dict:
+                st.warning("Hosting capacity solve did not converge.")
+            else:
+                hc_clean = {b: (5000.0 if v == float("inf") else float(v)) for b, v in hc_dict.items()}
+                df_hc = pd.DataFrame([
+                    {"Bus": b, "Headroom (kW)": v, "Status": (
+                        "Constrained (< 100 kW)" if v < 100 else
+                        "Limited (100–500 kW)" if v < 500 else
+                        "Comfortable (500–1500 kW)" if v < 1500 else
+                        "Unbounded (regulator absorbs PV)"
+                    )} for b, v in hc_clean.items()
+                ]).sort_values("Headroom (kW)").reset_index(drop=True)
+
+                color_map = {
+                    "Constrained (< 100 kW)": COLOR["alert"],
+                    "Limited (100–500 kW)": COLOR["stress"],
+                    "Comfortable (500–1500 kW)": COLOR["accent"],
+                    "Unbounded (regulator absorbs PV)": COLOR["ok"],
+                }
+                fig = go.Figure()
+                for status, sub in df_hc.groupby("Status", sort=False):
+                    fig.add_trace(go.Bar(
+                        y=[f"Bus {b}" for b in sub["Bus"]],
+                        x=sub["Headroom (kW)"],
+                        orientation="h",
+                        name=status,
+                        marker_color=color_map.get(status, COLOR["neutral"]),
+                    ))
+                layout = _layout("PV HOSTING HEADROOM PER BUS · TOWARD 1.05 PU LIMIT", height=620)
+                layout["margin"] = dict(l=20, r=20, t=44, b=80)
+                layout["yaxis"] = dict(autorange="reversed", tickfont=dict(size=11),
+                                       gridcolor="rgba(0,0,0,0)")
+                layout["barmode"] = "stack"
+                fig.update_layout(**layout)
+                fig.update_xaxes(title_text="kW additional PV before voltage hits 1.05 pu",
+                                 title_font=dict(size=11, color=COLOR["text_dim"]))
+                st.plotly_chart(fig, width="stretch")
+                st.caption(
+                    "Headroom is computed by injecting test PV (200 kW) at each bus, "
+                    "measuring ΔV, and back-extrapolating to the 1.05 pu limit. "
+                    "*Unbounded* buses are downstream of a voltage regulator that "
+                    "absorbs the PV-induced voltage rise — they are the priority "
+                    "interconnection candidates."
+                )
+
+        with padv_b:
+            st.markdown(
+                "**N-1 contingency** — re-solve OpenDSS with one element taken out "
+                "and compare violation counts to the in-service base case. This is "
+                "how planners decide whether a feeder needs redundant tie-switches "
+                "or whether a regulator is a single point of failure."
+            )
+            contingency_options = {
+                "Voltage regulator Reg1 (@ Bus 814)": "RegControl.Reg1",
+                "Voltage regulator Reg2 (@ Bus 852)": "RegControl.Reg2",
+                "In-line transformer 832 → 888": "Transformer.XFM_832_888",
+                "Long line 818 → 820 (longest 302-config segment)": "Line.L_818_820",
+                "Substation transformer (Sub)": "Transformer.Sub",
+            }
+            ctg_selected = st.multiselect(
+                "Elements to take out of service",
+                options=list(contingency_options.keys()),
+                default=[],
+                help="Select one or more elements. The OpenDSS deck is re-solved "
+                     "with each element disabled; results are compared to the base case.",
+            )
+            if not ctg_selected:
+                st.info("Pick at least one element above to run a contingency analysis.")
+            else:
+                disabled = tuple(contingency_options[k] for k in ctg_selected)
+                day_kw_flat = day_kw[0].astype(np.float32)
+                base_dicts = _solve(day_kw_flat.tobytes(), tuple(bus_order), day_kw_flat.shape)
+                ctg_dicts  = _solve_contingency(day_kw_flat.tobytes(), tuple(bus_order),
+                                                day_kw_flat.shape, disabled)
+                base_res = _to_hour_results(base_dicts)
+                ctg_res  = _to_hour_results(ctg_dicts)
+                n_v_base = sum(len(r.voltage_violations) for r in base_res)
+                n_v_ctg  = sum(len(r.voltage_violations) for r in ctg_res)
+                n_t_base = sum(len(r.thermal_overloads) for r in base_res)
+                n_t_ctg  = sum(len(r.thermal_overloads) for r in ctg_res)
+                worst_base = min((v for r in base_res for v in r.bus_voltage_pu.values()),
+                                 default=float("nan"))
+                worst_ctg  = min((v for r in ctg_res for v in r.bus_voltage_pu.values()),
+                                 default=float("nan"))
+
+                cc1, cc2, cc3 = st.columns(3)
+                cc1.metric("Voltage violations (24 hr)", n_v_ctg, f"{n_v_ctg - n_v_base:+d} vs base",
+                           delta_color="inverse")
+                cc2.metric("Thermal overloads (24 hr)", n_t_ctg, f"{n_t_ctg - n_t_base:+d} vs base",
+                           delta_color="inverse")
+                cc3.metric("Worst voltage (pu)", f"{worst_ctg:.3f}",
+                           f"{worst_ctg - worst_base:+.3f} vs base",
+                           delta_color="normal")
+                verdict_color = (COLOR["ok"] if n_v_ctg == n_v_base else
+                                 COLOR["warn"] if n_v_ctg < n_v_base + 5 else COLOR["alert"])
+                verdict_text = (
+                    "Feeder rides through this contingency without new violations." if n_v_ctg == n_v_base else
+                    f"Contingency adds {n_v_ctg - n_v_base} violation hours — degraded but operable." if n_v_ctg < n_v_base + 10 else
+                    f"Severe contingency: {n_v_ctg - n_v_base} new violation hours. "
+                    f"Consider tie-switch / redundant regulator investment."
+                )
+                st.markdown(
+                    f"<div style='margin-top:12px; padding:10px 14px; border-left:3px solid "
+                    f"{verdict_color}; background:{COLOR['bg_card']}; border-radius:3px; "
+                    f"font-size:0.92rem; color:{COLOR['text']};'>"
+                    f"<b style='color:{verdict_color};'>Planner verdict:</b> {verdict_text}"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
 
 
 def _render_planner_action_card(a):
