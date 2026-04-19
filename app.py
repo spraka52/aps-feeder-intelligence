@@ -1,8 +1,8 @@
-"""APS Spatio-Temporal Feeder Intelligence — Streamlit utility dashboard."""
+"""APS Spatio-Temporal Feeder Intelligence — operator + planner dashboard."""
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -15,7 +15,12 @@ import streamlit as st
 from data.synthesize import load_dataset
 from data.topology import COORDS, SPOT_LOADS_KW, build_graph
 from decisions.action_engine import (
-    actions_to_df, build_actions, headline_kpis,
+    actions_to_df as ops_actions_to_df,
+    build_actions, headline_kpis,
+)
+from decisions.planner_actions import (
+    aggregate_weekly_violations, build_planner_actions,
+    actions_to_df as planner_actions_to_df, _bus_day_hours_matrix,
 )
 from models.dataset import FeederWindowDataset, WindowSpec
 from models.predict import Forecaster
@@ -28,7 +33,7 @@ BASELINE_NPZ = REPO / "data" / "synthetic" / "baseline.npz"
 STRESS_NPZ = REPO / "data" / "synthetic" / "stress_ev35_pv8.npz"
 
 
-# --- Caching wrappers ------------------------------------------------------ #
+# --- Caching --------------------------------------------------------------- #
 
 @st.cache_resource(show_spinner="Loading model…")
 def _get_forecaster(ckpt_mtime: float):
@@ -56,6 +61,21 @@ def _to_hour_results(dicts: List[dict]):
 def _file_signature(p: Path) -> Tuple[float, int]:
     s = p.stat()
     return (s.st_mtime, s.st_size)
+
+
+@st.cache_data(show_spinner="Computing week-aggregate physics for the planner…")
+def _solve_week_truth(week_kw_bytes: bytes, bus_order: tuple, day_shape: tuple,
+                      week_label: str) -> List[List[dict]]:
+    """Run OpenDSS day-by-day on the synthesized "ground truth" loads
+    (rather than the 24-hour-ahead forecasts) to produce a clean weekly view."""
+    from physics.opendss_runner import _hourresult_to_dict
+    week_kw = np.frombuffer(week_kw_bytes, dtype=np.float32).reshape(day_shape)
+    out: List[List[dict]] = []
+    for d in range(week_kw.shape[0]):
+        day_loads = week_kw[d]  # [24, N]
+        day_results = run_forecast_horizon(day_loads, list(bus_order))
+        out.append([_hourresult_to_dict(r) for r in day_results])
+    return out
 
 
 # --- Map helpers ----------------------------------------------------------- #
@@ -88,7 +108,9 @@ def feeder_map_deck(
 
     flagged = set()
     if not actions_df.empty:
-        flagged = set(actions_df["bus_or_line"].astype(str).tolist())
+        # planner_actions uses 'bus', operator uses 'bus_or_line'
+        col = "bus_or_line" if "bus_or_line" in actions_df.columns else "bus"
+        flagged = set(actions_df[col].astype(str).tolist())
 
     nodes, halos, labels = [], [], []
     for b in fg.g.nodes():
@@ -174,10 +196,10 @@ def voltage_legend_chip():
     st.markdown(
         """
         <div style="display:flex; gap:24px; align-items:center; font-size:12px; opacity:0.85; flex-wrap:wrap; margin: 8px 0 4px;">
-          <span style="display:flex;align-items:center;gap:6px;"><span style="width:14px;height:14px;border-radius:50%;background:#50C350;display:inline-block;"></span>~1.00 pu (healthy)</span>
-          <span style="display:flex;align-items:center;gap:6px;"><span style="width:14px;height:14px;border-radius:50%;background:#EBC83C;display:inline-block;"></span>0.95 / 1.05 pu (limit)</span>
-          <span style="display:flex;align-items:center;gap:6px;"><span style="width:14px;height:14px;border-radius:50%;background:#D23232;display:inline-block;"></span>≤0.93 / ≥1.07 pu (violation)</span>
-          <span style="display:flex;align-items:center;gap:6px;"><span style="width:14px;height:14px;border-radius:50%;background:#FFC400;opacity:0.8;display:inline-block;"></span>action target halo</span>
+          <span style="display:flex;align-items:center;gap:6px;"><span style="width:14px;height:14px;border-radius:50%;background:#50C350;display:inline-block;"></span>~1.00 pu</span>
+          <span style="display:flex;align-items:center;gap:6px;"><span style="width:14px;height:14px;border-radius:50%;background:#EBC83C;display:inline-block;"></span>limit</span>
+          <span style="display:flex;align-items:center;gap:6px;"><span style="width:14px;height:14px;border-radius:50%;background:#D23232;display:inline-block;"></span>violation</span>
+          <span style="display:flex;align-items:center;gap:6px;"><span style="width:14px;height:14px;border-radius:50%;background:#FFC400;opacity:0.8;display:inline-block;"></span>action target</span>
           <span style="display:flex;align-items:center;gap:6px;"><span style="width:18px;height:4px;background:#B43232;display:inline-block;"></span>transformer</span>
         </div>
         """,
@@ -209,10 +231,10 @@ def violations_chart(res_b, res_s, times) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(go.Bar(x=list(times),
                          y=[len(r.voltage_violations) for r in res_b],
-                         name="Baseline · V violations", marker_color="#5BA3F5"))
+                         name="Baseline", marker_color="#5BA3F5"))
     fig.add_trace(go.Bar(x=list(times),
                          y=[len(r.voltage_violations) for r in res_s],
-                         name="Stress · V violations", marker_color="#F08C3C"))
+                         name="Stress (heat+EV)", marker_color="#F08C3C"))
     fig.update_layout(
         title=dict(text="Voltage violations per hour", font=dict(size=15)),
         barmode="group", height=300, margin=dict(l=10, r=10, t=50, b=20),
@@ -228,26 +250,88 @@ def reg_tap_chart(res_b, res_s, times) -> go.Figure:
     fig = go.Figure()
     palettes = {"baseline": "#5BA3F5", "stress": "#F08C3C"}
     line_dash = {"reg1": "solid", "reg2": "dash"}
-    for kind, results, dash_offset in [("baseline", res_b, 1.0), ("stress", res_s, 0.7)]:
+    for kind, results, op in [("baseline", res_b, 1.0), ("stress", res_s, 0.7)]:
         for name in reg_names:
             ys = [r.regulator_taps.get(name, None) for r in results]
             fig.add_trace(go.Scatter(
                 x=list(times), y=ys, mode="lines+markers",
                 name=f"{kind} · {name.upper()}",
                 line=dict(width=2, color=palettes[kind], dash=line_dash.get(name, "solid")),
-                marker=dict(size=4),
-                opacity=dash_offset,
+                marker=dict(size=4), opacity=op,
             ))
     fig.update_layout(
-        title=dict(text="Regulator tap positions · QSTS evolution across the 24-hour horizon", font=dict(size=15)),
-        xaxis_title=None, yaxis_title="tap step (+ boost / – buck)",
+        title=dict(text="Regulator tap positions · QSTS", font=dict(size=15)),
+        xaxis_title=None, yaxis_title="tap step",
         height=320, margin=dict(l=10, r=10, t=50, b=20),
         legend=dict(orientation="h", y=-0.2),
     )
     return fig
 
 
-# --- Scenario presets ------------------------------------------------------ #
+def violation_heatmap(mat_df: pd.DataFrame, dates) -> go.Figure:
+    """Bus × Day heatmap, color = violation hours."""
+    # Sort buses by total violation hours descending; show top 20 for readability
+    totals = mat_df.sum(axis=1)
+    top_buses = totals[totals > 0].sort_values(ascending=False).head(20).index.tolist()
+    if not top_buses:
+        # show all buses anyway
+        top_buses = mat_df.index.tolist()[:20]
+    sub = mat_df.loc[top_buses]
+    fig = go.Figure(data=go.Heatmap(
+        z=sub.values,
+        x=[d.strftime("%a %b %d") for d in dates],
+        y=[f"Bus {b}" for b in sub.index],
+        colorscale=[[0, "#1F2630"], [0.01, "#2C3340"], [0.3, "#EBC83C"], [0.6, "#F08C3C"], [1, "#D23232"]],
+        zmin=0, zmax=max(1, int(sub.values.max())),
+        hovertemplate="Bus %{y}<br>%{x}<br><b>%{z}</b> violation hours<extra></extra>",
+        colorbar=dict(title="hr/day", thickness=12, len=0.8),
+    ))
+    fig.update_layout(
+        title=dict(text="Bus × Day · voltage-violation hours", font=dict(size=15)),
+        height=520, margin=dict(l=10, r=10, t=50, b=20),
+        xaxis=dict(side="top"),
+    )
+    return fig
+
+
+def top_buses_bar(weekly_df: pd.DataFrame, n: int = 10) -> go.Figure:
+    sub = weekly_df.head(n).copy()
+    sub = sub[sub["violation_hours_week"] > 0]
+    fig = go.Figure(go.Bar(
+        x=sub["violation_hours_week"],
+        y=[f"Bus {b}" for b in sub["bus"]],
+        orientation="h",
+        marker=dict(color=sub["violation_hours_week"], colorscale="Reds", showscale=False),
+        text=[f"{int(v)} hr · worst {w:.3f} pu" for v, w in
+              zip(sub["violation_hours_week"], sub["worst_v_pu"])],
+        textposition="outside",
+    ))
+    fig.update_layout(
+        title=dict(text=f"Top {n} stressed buses · weekly violation-hours", font=dict(size=15)),
+        height=420, margin=dict(l=10, r=10, t=50, b=20),
+        yaxis=dict(autorange="reversed"),
+    )
+    return fig
+
+
+def weekly_trend_chart(trend_df: pd.DataFrame) -> go.Figure:
+    if trend_df.empty:
+        return go.Figure()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=trend_df["week_start"], y=trend_df["total_violation_hours"],
+        mode="lines+markers", line=dict(width=2, color="#F08C3C"),
+        name="Total violation-hours", marker=dict(size=8),
+    ))
+    fig.update_layout(
+        title=dict(text="Multi-week trend · stress evolution across the season", font=dict(size=15)),
+        xaxis_title=None, yaxis_title="violation hours / week",
+        height=300, margin=dict(l=10, r=10, t=50, b=20),
+    )
+    return fig
+
+
+# --- Scenario presets (operator) ------------------------------------------ #
 
 def _summer_scenarios(times: pd.DatetimeIndex, heatwave: np.ndarray) -> Dict[str, datetime]:
     df = pd.DataFrame({"time": times, "hw": heatwave})
@@ -268,7 +352,7 @@ def _summer_scenarios(times: pd.DatetimeIndex, heatwave: np.ndarray) -> Dict[str
     return presets
 
 
-# --- App body --------------------------------------------------------------- #
+# --- Page setup ----------------------------------------------------------- #
 
 st.set_page_config(
     page_title="APS Feeder Intelligence",
@@ -277,13 +361,10 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# Generous custom CSS for breathing room + cleaner typography
 st.markdown(
     """
     <style>
-        /* Wider center column with more padding */
-        .block-container {padding-top: 2.5rem !important; padding-bottom: 3rem !important; max-width: 1400px;}
-        /* Bigger metric numbers, generous spacing */
+        .block-container {padding-top: 2.5rem !important; padding-bottom: 3rem !important; max-width: 1480px;}
         div[data-testid="stMetricValue"] {font-size: 2.0rem; font-weight: 600;}
         div[data-testid="stMetricLabel"] {font-size: 0.85rem; opacity: 0.75; text-transform: uppercase; letter-spacing: 0.05em;}
         div[data-testid="stMetricDelta"] {font-size: 0.95rem;}
@@ -293,32 +374,51 @@ st.markdown(
             border-radius: 8px;
             border-left: 3px solid rgba(91, 163, 245, 0.5);
         }
-        /* Tab labels bigger */
         button[data-baseweb="tab"] {font-size: 1rem !important; padding: 0.75rem 1.5rem !important;}
-        /* Scenario chip card */
+        .role-banner {
+            background: linear-gradient(135deg, rgba(91,163,245,0.12), rgba(91,163,245,0.02));
+            border-left: 4px solid #5BA3F5;
+            padding: 1.0rem 1.2rem;
+            border-radius: 6px;
+            margin: 0.5rem 0 1.2rem;
+        }
+        .role-banner-planner {
+            background: linear-gradient(135deg, rgba(167,139,255,0.12), rgba(167,139,255,0.02));
+            border-left: 4px solid #A78BFF;
+            padding: 1.0rem 1.2rem;
+            border-radius: 6px;
+            margin: 0.5rem 0 1.2rem;
+        }
         .scenario-banner {
             background: linear-gradient(135deg, rgba(255,196,0,0.10), rgba(255,196,0,0.02));
             border-left: 4px solid #FFC400;
-            padding: 1.0rem 1.2rem;
+            padding: 0.85rem 1.1rem;
             border-radius: 6px;
-            margin: 0.5rem 0 1.5rem;
-            font-size: 0.95rem;
+            margin: 0.4rem 0 1.0rem;
+            font-size: 0.92rem;
         }
-        .scenario-banner b {color: #FFC400;}
-        /* Section spacing */
+        .now-callout {
+            background: linear-gradient(135deg, rgba(240,140,60,0.18), rgba(240,140,60,0.04));
+            border-left: 4px solid #F08C3C;
+            padding: 1.2rem 1.4rem;
+            border-radius: 6px;
+            margin-bottom: 1rem;
+        }
+        .now-callout b {color: #F08C3C; font-size: 1.05rem;}
         h2, h3 {margin-top: 1.5rem !important; margin-bottom: 0.6rem !important;}
-        /* Keep table rows compact */
         div[data-testid="stDataFrame"] td, div[data-testid="stDataFrame"] th {font-size: 0.88rem;}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-# Header
-col_logo, col_title, col_links = st.columns([1, 6, 2])
+
+# --- Header --------------------------------------------------------------- #
+
+col_title, col_links = st.columns([8, 2])
 with col_title:
     st.markdown("## ⚡ APS Spatio-Temporal Feeder Intelligence")
-    st.caption("GraphSAGE + GRU forecaster · OpenDSS QSTS validation · operator-ready decision layer")
+    st.caption("GraphSAGE + GRU forecaster · OpenDSS QSTS validation · operator + planner decision layers")
 with col_links:
     st.markdown(
         "<div style='text-align:right; padding-top:1.4rem;'>"
@@ -329,7 +429,7 @@ with col_links:
     )
 
 if not CKPT_PATH.exists() or not BASELINE_NPZ.exists():
-    st.error("Missing artifacts. Run `python -m data.synthesize --multi` then `python -m models.train --epochs 25`.")
+    st.error("Missing artifacts. Run `python -m data.synthesize --multi --customers resstock` then `python -m models.train --epochs 25`.")
     st.stop()
 
 # Load data
@@ -344,256 +444,486 @@ ds_stress = _get_dataset(str(STRESS_NPZ), *stress_sig)
 times = ds_base.times
 all_days = sorted({t.date() for t in times})
 years_available = sorted({t.year for t in times})
-scenarios = _summer_scenarios(times, ds_base.heatwave)
 
-# ================== TOP: scenario picker (horizontal bar) ================== #
-st.markdown("##### 📅 Pick a scenario")
-scenario_keys = list(scenarios.keys()) + ["✏ Custom date / hour"]
-default_idx = 0
-pick_scenario = st.radio(
-    "Pick a scenario",
-    scenario_keys,
-    index=default_idx,
+# ================== TOP: ROLE SWITCH ====================================== #
+role = st.radio(
+    "Role",
+    ["👷 Operator · hour-by-hour", "📐 Planner · week-by-week"],
     horizontal=True,
     label_visibility="collapsed",
 )
 
-if pick_scenario == "✏ Custom date / hour":
-    cc1, cc2, _ = st.columns([2, 1, 4])
-    with cc1:
-        default_day = scenarios[list(scenarios.keys())[0]].date() if scenarios else all_days[24]
-        pick_day = st.date_input("Date", value=default_day,
-                                 min_value=all_days[24], max_value=all_days[-2])
-    with cc2:
-        pick_hour = st.slider("Start hour", 0, 23, 6)
-    scenario_label = f"Custom · {pick_day} {pick_hour:02d}:00"
-else:
-    scenario_ts = scenarios[pick_scenario]
-    pick_day = scenario_ts.date()
-    pick_hour = scenario_ts.hour
-    scenario_label = pick_scenario
+st.markdown("---")
 
-# Compute window
-target_ts = pd.Timestamp(pick_day, tz=times.tz) + pd.Timedelta(hours=pick_hour)
-deltas = (times - target_ts).asi8
-t0_full = int(np.argmin(np.abs(deltas)))
-t0 = max(0, t0_full - forecaster.horizon_in)
-if t0 + forecaster.horizon_in + forecaster.horizon_out > len(times):
-    t0 = len(times) - forecaster.horizon_in - forecaster.horizon_out
-fcst_times = times[t0 + forecaster.horizon_in : t0 + forecaster.horizon_in + forecaster.horizon_out]
-hw_in_window = int(ds_base.heatwave[t0 + forecaster.horizon_in : t0 + forecaster.horizon_in + forecaster.horizon_out].sum())
 
-# Scenario banner
-st.markdown(
-    f"""
-    <div class='scenario-banner'>
-      <b>{scenario_label}</b> &nbsp;·&nbsp;
-      forecast horizon: {fcst_times[0].strftime('%a %b %d, %H:%M')} → {fcst_times[-1].strftime('%a %b %d, %H:%M')}
-      &nbsp;·&nbsp; <b>{hw_in_window}/24</b> hours fall inside a heatwave window
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+# =============================================================================
+#                              OPERATOR VIEW
+# =============================================================================
 
-# Run forecasts + OpenDSS
-fcst_base = forecaster.forecast_window(ds_base, t0)
-fcst_stress = forecaster.forecast_window(ds_stress, t0)
-bus_order = tuple(forecaster.bus_order)
+def render_operator_view():
+    st.markdown(
+        "<div class='role-banner'>"
+        "<b style='color:#5BA3F5;'>👷 OPERATOR VIEW</b> &nbsp;·&nbsp; "
+        "Pick a forecast window. The model predicts the next 24 hours per bus, "
+        "OpenDSS QSTS validates the physics each hour, and the Action Center ranks "
+        "what to do — sized in kW, ordered by priority."
+        "</div>",
+        unsafe_allow_html=True,
+    )
 
-res_base_d = _solve(fcst_base.astype(np.float32).tobytes(), bus_order, fcst_base.shape)
-res_stress_d = _solve(fcst_stress.astype(np.float32).tobytes(), bus_order, fcst_stress.shape)
-res_base = _to_hour_results(res_base_d)
-res_stress = _to_hour_results(res_stress_d)
+    scenarios = _summer_scenarios(times, ds_base.heatwave)
+    st.markdown("##### 📅 Pick a scenario")
+    scenario_keys = list(scenarios.keys()) + ["✏ Custom date / hour"]
+    pick_scenario = st.radio(
+        "Pick a scenario",
+        scenario_keys, index=0, horizontal=True, label_visibility="collapsed",
+    )
 
-if not any(r.converged for r in res_base) or not any(r.converged for r in res_stress):
-    st.warning("OpenDSS solver hit a stability error on this window — showing forecast panels only. Pick a different start.")
-
-hw_mask = ds_base.heatwave[t0 + forecaster.horizon_in : t0 + forecaster.horizon_in + forecaster.horizon_out]
-actions_base = build_actions(res_base, fcst_times, fcst_base, list(bus_order), hw_mask)
-actions_stress = build_actions(res_stress, fcst_times, fcst_stress, list(bus_order), hw_mask)
-kpi_base = headline_kpis(res_base, fcst_base, hw_mask)
-kpi_stress = headline_kpis(res_stress, fcst_stress, hw_mask)
-
-# ================== KPI strip ============================================== #
-st.markdown("### Operator KPIs · stress vs baseline")
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Peak feeder load", f"{kpi_stress['peak_forecast_kw']:.0f} kW",
-          f"{kpi_stress['peak_forecast_kw'] - kpi_base['peak_forecast_kw']:+.0f} vs base",
-          help="Highest single-hour total kW across all 34 buses in the 24-hour forecast.")
-c2.metric("Voltage violations", kpi_stress["n_voltage_violations"],
-          f"{kpi_stress['n_voltage_violations'] - kpi_base['n_voltage_violations']:+d} vs base",
-          delta_color="inverse",
-          help="Count of (hour × bus) pairs where OpenDSS reported V outside [0.95, 1.05] pu.")
-c3.metric("Thermal overloads", kpi_stress["n_thermal_overloads"],
-          f"{kpi_stress['n_thermal_overloads'] - kpi_base['n_thermal_overloads']:+d} vs base",
-          delta_color="inverse",
-          help="Count of (hour × line) pairs where line current exceeded NormAmps.")
-c4.metric("Peak losses", f"{kpi_stress['peak_loss_kw']:.0f} kW",
-          f"{kpi_stress['peak_loss_kw'] - kpi_base['peak_loss_kw']:+.0f} vs base",
-          delta_color="inverse",
-          help="Worst-hour I²R losses summed over all lines, from the OpenDSS solve.")
-
-st.divider()
-
-# ================== Tabs: Map | Forecast | Actions | About =============== #
-tab_map, tab_forecast, tab_actions, tab_about = st.tabs([
-    "🗺  Operations Map",
-    "📈  Forecast & Physics",
-    "⚙  Action Center",
-    "ℹ  Model & About",
-])
-
-# ---------------- Map tab --------------------------------------------------- #
-with tab_map:
-    fcst_hour_options = [t.strftime("%a %b %d · %H:%M") for t in fcst_times]
-    default_hour_idx = 18 if len(fcst_hour_options) > 18 else len(fcst_hour_options) // 2
-
-    cs1, cs2 = st.columns([3, 1])
-    with cs1:
-        selected_hour_label = st.select_slider(
-            "Hour into the forecast",
-            options=fcst_hour_options,
-            value=fcst_hour_options[default_hour_idx],
-            help="Slide to watch voltages evolve hour-by-hour. Yellow halo = bus flagged for action.",
-        )
-    with cs2:
-        compare_view = st.toggle(
-            "Show baseline beside stress",
-            value=False,
-            help="When off, you see one map (the stress scenario). Toggle on for a side-by-side comparison.",
-        )
-    map_hour = fcst_hour_options.index(selected_hour_label)
-    voltage_legend_chip()
-
-    voltages_per_hour_base = [r.bus_voltage_pu for r in res_base]
-    voltages_per_hour_stress = [r.bus_voltage_pu for r in res_stress]
-    worst_v_base = min(voltages_per_hour_base[map_hour].values()) if voltages_per_hour_base[map_hour] else float("nan")
-    worst_v_stress = min(voltages_per_hour_stress[map_hour].values()) if voltages_per_hour_stress[map_hour] else float("nan")
-
-    if compare_view:
-        mc1, mc2 = st.columns(2)
-        with mc1:
-            st.markdown(
-                f"**Baseline** · worst V at this hour: "
-                f"<span style='color:{'#D23232' if worst_v_base < 0.95 else '#50C350'};'><b>{worst_v_base:.3f} pu</b></span>",
-                unsafe_allow_html=True,
-            )
-            st.pydeck_chart(
-                feeder_map_deck(voltages_per_hour_base, map_hour, actions_to_df(actions_base)),
-                height=520,
-            )
-        with mc2:
-            st.markdown(
-                f"**Stress (heat + EV)** · worst V at this hour: "
-                f"<span style='color:{'#D23232' if worst_v_stress < 0.95 else '#50C350'};'><b>{worst_v_stress:.3f} pu</b></span>",
-                unsafe_allow_html=True,
-            )
-            st.pydeck_chart(
-                feeder_map_deck(voltages_per_hour_stress, map_hour, actions_to_df(actions_stress)),
-                height=520,
-            )
+    if pick_scenario == "✏ Custom date / hour":
+        cc1, cc2, _ = st.columns([2, 1, 4])
+        with cc1:
+            default_day = scenarios[list(scenarios.keys())[0]].date() if scenarios else all_days[24]
+            pick_day = st.date_input("Date", value=default_day,
+                                     min_value=all_days[24], max_value=all_days[-2])
+        with cc2:
+            pick_hour = st.slider("Start hour", 0, 23, 6)
+        scenario_label = f"Custom · {pick_day} {pick_hour:02d}:00"
     else:
+        scenario_ts = scenarios[pick_scenario]
+        pick_day = scenario_ts.date()
+        pick_hour = scenario_ts.hour
+        scenario_label = pick_scenario
+
+    target_ts = pd.Timestamp(pick_day, tz=times.tz) + pd.Timedelta(hours=pick_hour)
+    deltas = (times - target_ts).asi8
+    t0_full = int(np.argmin(np.abs(deltas)))
+    t0 = max(0, t0_full - forecaster.horizon_in)
+    if t0 + forecaster.horizon_in + forecaster.horizon_out > len(times):
+        t0 = len(times) - forecaster.horizon_in - forecaster.horizon_out
+    fcst_times = times[t0 + forecaster.horizon_in : t0 + forecaster.horizon_in + forecaster.horizon_out]
+    hw_in_window = int(ds_base.heatwave[t0 + forecaster.horizon_in : t0 + forecaster.horizon_in + forecaster.horizon_out].sum())
+
+    st.markdown(
+        f"<div class='scenario-banner'><b>{scenario_label}</b> "
+        f"&nbsp;·&nbsp; horizon: {fcst_times[0].strftime('%a %b %d, %H:%M')} → "
+        f"{fcst_times[-1].strftime('%a %b %d, %H:%M')} &nbsp;·&nbsp; "
+        f"<b>{hw_in_window}/24</b> heatwave hours in window</div>",
+        unsafe_allow_html=True,
+    )
+
+    # Run forecasts + OpenDSS
+    fcst_base = forecaster.forecast_window(ds_base, t0)
+    fcst_stress = forecaster.forecast_window(ds_stress, t0)
+    bus_order = tuple(forecaster.bus_order)
+
+    res_base_d = _solve(fcst_base.astype(np.float32).tobytes(), bus_order, fcst_base.shape)
+    res_stress_d = _solve(fcst_stress.astype(np.float32).tobytes(), bus_order, fcst_stress.shape)
+    res_base = _to_hour_results(res_base_d)
+    res_stress = _to_hour_results(res_stress_d)
+
+    if not any(r.converged for r in res_base) or not any(r.converged for r in res_stress):
+        st.warning("OpenDSS solver hit a stability error on this window — pick a different start.")
+
+    hw_mask = ds_base.heatwave[t0 + forecaster.horizon_in : t0 + forecaster.horizon_in + forecaster.horizon_out]
+    actions_base = build_actions(res_base, fcst_times, fcst_base, list(bus_order), hw_mask)
+    actions_stress = build_actions(res_stress, fcst_times, fcst_stress, list(bus_order), hw_mask)
+    kpi_base = headline_kpis(res_base, fcst_base, hw_mask)
+    kpi_stress = headline_kpis(res_stress, fcst_stress, hw_mask)
+
+    # ----- "Right now" callout — first-hour or worst-hour action ----------- #
+    df_stress_actions = ops_actions_to_df(actions_stress)
+    if not df_stress_actions.empty:
+        top = df_stress_actions.iloc[0]
+        first_hour = pd.Timestamp(top["when"])
+        hours_until = max(0, int((first_hour - fcst_times[0]).total_seconds() // 3600))
+        urgency = "Take action now" if hours_until <= 1 else f"Pre-position in {hours_until} h"
         st.markdown(
-            f"**Stress scenario (heat + 35% EV evening growth)** · worst V at this hour: "
-            f"<span style='color:{'#D23232' if worst_v_stress < 0.95 else '#50C350'};'><b>{worst_v_stress:.3f} pu</b></span>"
-            f" &nbsp;·&nbsp; <span style='opacity:0.7;'>baseline worst: {worst_v_base:.3f} pu</span>",
+            f"""
+            <div class='now-callout'>
+              <b>⚡ {urgency}</b> &nbsp;·&nbsp; Priority {int(top['priority'])} · {top['kind']}
+              <br/>
+              <span style='font-size:1.05rem;'>{top['recommendation']}</span>
+              <br/>
+              <span style='opacity:0.75; font-size:0.9rem;'>worst at {first_hour.strftime('%a %b %d %H:%M')} ·
+              {int(top['hours_affected'])} hours affected · severity {float(top['severity']):.2f}</span>
+            </div>
+            """,
             unsafe_allow_html=True,
         )
-        st.pydeck_chart(
-            feeder_map_deck(voltages_per_hour_stress, map_hour, actions_to_df(actions_stress)),
-            height=620,
+    else:
+        st.markdown(
+            "<div class='now-callout'><b>✅ No actions required in the next 24 hours.</b> "
+            "Feeder is operating within voltage and thermal limits.</div>",
+            unsafe_allow_html=True,
         )
 
-# ---------------- Forecast tab --------------------------------------------- #
-with tab_forecast:
-    st.plotly_chart(horizon_chart(fcst_base, fcst_stress, fcst_times), width="stretch")
+    # ----- KPI strip ------------------------------------------------------- #
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Peak feeder load", f"{kpi_stress['peak_forecast_kw']:.0f} kW",
+              f"{kpi_stress['peak_forecast_kw'] - kpi_base['peak_forecast_kw']:+.0f} vs base",
+              help="Highest single-hour total kW.")
+    c2.metric("Voltage violations", kpi_stress["n_voltage_violations"],
+              f"{kpi_stress['n_voltage_violations'] - kpi_base['n_voltage_violations']:+d} vs base",
+              delta_color="inverse", help="(hour × bus) pairs outside [0.95, 1.05] pu.")
+    c3.metric("Thermal overloads", kpi_stress["n_thermal_overloads"],
+              f"{kpi_stress['n_thermal_overloads'] - kpi_base['n_thermal_overloads']:+d} vs base",
+              delta_color="inverse")
+    c4.metric("Peak losses", f"{kpi_stress['peak_loss_kw']:.0f} kW",
+              f"{kpi_stress['peak_loss_kw'] - kpi_base['peak_loss_kw']:+.0f} vs base",
+              delta_color="inverse")
+
     st.divider()
-    cf1, cf2 = st.columns(2)
-    with cf1:
-        st.plotly_chart(violations_chart(res_base, res_stress, fcst_times), width="stretch")
-    with cf2:
-        st.plotly_chart(reg_tap_chart(res_base, res_stress, fcst_times), width="stretch")
 
-# ---------------- Action Center tab ---------------------------------------- #
-with tab_actions:
-    st.caption("Each violation is grouped by location and time, scored by how far out of bounds and how persistent, "
-               "and converted into a sized recommendation a control-room operator could act on.")
-    show_action_count = st.slider("Top N actions", 3, 15, 8)
+    # ----- Tabs: Map | Forecast | Action timeline | Action Center ---------- #
+    tab_map, tab_forecast, tab_timeline, tab_actions = st.tabs([
+        "🗺  Operations Map", "📈  Forecast & Physics",
+        "⏱  Hourly Action Timeline", "⚙  Action Center",
+    ])
 
-    sub_stress, sub_base = st.tabs(["🔥 Stress scenario", "🌤 Baseline scenario"])
+    with tab_map:
+        fcst_hour_options = [t.strftime("%a %b %d · %H:%M") for t in fcst_times]
+        default_hour_idx = 18 if len(fcst_hour_options) > 18 else len(fcst_hour_options) // 2
 
-    def _render_actions(actions_list, label):
-        df = actions_to_df(actions_list).head(show_action_count)
-        if df.empty:
-            st.success(f"No violations detected in the {label} forecast — feeder is operating within limits.")
-            return
-        df_display = df.rename(columns={
-            "priority": "Pri.", "kind": "Kind", "bus_or_line": "Where",
-            "when": "When (worst hour)", "hours_affected": "Hrs",
-            "severity": "Severity", "target_kw": "Sized kW",
-            "detail": "What happened", "recommendation": "Recommended action",
+        cs1, cs2 = st.columns([3, 1])
+        with cs1:
+            selected_hour_label = st.select_slider(
+                "Hour into the forecast",
+                options=fcst_hour_options,
+                value=fcst_hour_options[default_hour_idx],
+            )
+        with cs2:
+            compare_view = st.toggle("Show baseline beside stress", value=False)
+        map_hour = fcst_hour_options.index(selected_hour_label)
+        voltage_legend_chip()
+
+        voltages_per_hour_base = [r.bus_voltage_pu for r in res_base]
+        voltages_per_hour_stress = [r.bus_voltage_pu for r in res_stress]
+        worst_v_base = min(voltages_per_hour_base[map_hour].values()) if voltages_per_hour_base[map_hour] else float("nan")
+        worst_v_stress = min(voltages_per_hour_stress[map_hour].values()) if voltages_per_hour_stress[map_hour] else float("nan")
+
+        if compare_view:
+            mc1, mc2 = st.columns(2)
+            with mc1:
+                st.markdown(
+                    f"**Baseline** · worst V at this hour: "
+                    f"<span style='color:{'#D23232' if worst_v_base < 0.95 else '#50C350'};'><b>{worst_v_base:.3f} pu</b></span>",
+                    unsafe_allow_html=True,
+                )
+                st.pydeck_chart(
+                    feeder_map_deck(voltages_per_hour_base, map_hour, ops_actions_to_df(actions_base)),
+                    height=520,
+                )
+            with mc2:
+                st.markdown(
+                    f"**Stress (heat + EV)** · worst V at this hour: "
+                    f"<span style='color:{'#D23232' if worst_v_stress < 0.95 else '#50C350'};'><b>{worst_v_stress:.3f} pu</b></span>",
+                    unsafe_allow_html=True,
+                )
+                st.pydeck_chart(
+                    feeder_map_deck(voltages_per_hour_stress, map_hour, ops_actions_to_df(actions_stress)),
+                    height=520,
+                )
+        else:
+            st.markdown(
+                f"**Stress scenario (heat + 35% EV)** · worst V at this hour: "
+                f"<span style='color:{'#D23232' if worst_v_stress < 0.95 else '#50C350'};'><b>{worst_v_stress:.3f} pu</b></span>"
+                f" &nbsp;·&nbsp; <span style='opacity:0.7;'>baseline worst: {worst_v_base:.3f} pu</span>",
+                unsafe_allow_html=True,
+            )
+            st.pydeck_chart(
+                feeder_map_deck(voltages_per_hour_stress, map_hour, ops_actions_to_df(actions_stress)),
+                height=620,
+            )
+
+    with tab_forecast:
+        st.plotly_chart(horizon_chart(fcst_base, fcst_stress, fcst_times), width="stretch")
+        st.divider()
+        cf1, cf2 = st.columns(2)
+        with cf1:
+            st.plotly_chart(violations_chart(res_base, res_stress, fcst_times), width="stretch")
+        with cf2:
+            st.plotly_chart(reg_tap_chart(res_base, res_stress, fcst_times), width="stretch")
+
+    with tab_timeline:
+        st.caption("One row per forecast hour. Each row shows whether OpenDSS flagged a problem at that hour and what to do.")
+        # Build hour-by-hour timeline DataFrame
+        rows = []
+        actions_df = ops_actions_to_df(actions_stress)
+        for h, t in enumerate(fcst_times):
+            r = res_stress[h]
+            n_v = len(r.voltage_violations)
+            n_t = len(r.thermal_overloads)
+            worst_pu = min(r.bus_voltage_pu.values()) if r.bus_voltage_pu else float("nan")
+            # Find any action whose 'when' falls in this hour or earlier (but not yet executed)
+            hour_action = "—"
+            if not actions_df.empty:
+                same_hour = actions_df[pd.to_datetime(actions_df["when"]) == pd.Timestamp(t)]
+                if not same_hour.empty:
+                    hour_action = same_hour.iloc[0]["recommendation"]
+            status = "🟢 clean" if (n_v == 0 and n_t == 0) else (
+                f"🔴 {n_v} V · {n_t} thermal" if n_v + n_t > 3 else f"🟡 {n_v} V · {n_t} thermal")
+            rows.append({
+                "Hour": t.strftime("%a %b %d · %H:%M"),
+                "Status": status,
+                "Worst V (pu)": f"{worst_pu:.3f}",
+                "Total kW": f"{fcst_stress[h].sum():.0f}",
+                "Recommended action": hour_action,
+            })
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True, height=720)
+
+    with tab_actions:
+        show_n = st.slider("Top N actions", 3, 15, 8)
+        sub_stress, sub_base = st.tabs(["🔥 Stress scenario", "🌤 Baseline scenario"])
+
+        def _render(actions_list, label):
+            df = ops_actions_to_df(actions_list).head(show_n)
+            if df.empty:
+                st.success(f"No violations in the {label} forecast — feeder is within limits.")
+                return
+            df_disp = df.rename(columns={
+                "priority": "Pri.", "kind": "Kind", "bus_or_line": "Where",
+                "when": "When (worst hour)", "hours_affected": "Hrs",
+                "severity": "Severity", "target_kw": "Sized kW",
+                "detail": "What happened", "recommendation": "Recommended action",
+            })
+            st.dataframe(
+                df_disp[["Pri.", "Kind", "Where", "When (worst hour)", "Hrs",
+                         "Severity", "Sized kW", "What happened", "Recommended action"]],
+                width="stretch", hide_index=True, height=380,
+            )
+
+        with sub_stress:
+            _render(actions_stress, "stress")
+        with sub_base:
+            _render(actions_base, "baseline")
+
+
+# =============================================================================
+#                              PLANNER VIEW
+# =============================================================================
+
+def _build_summer_weeks(times: pd.DatetimeIndex) -> List[Tuple[pd.Timestamp, pd.Timestamp]]:
+    """Return a list of (week_start, week_end) Timestamps for full weeks within the dataset."""
+    weeks = []
+    start = times.min().normalize()
+    while start + pd.Timedelta(days=7) <= times.max():
+        weeks.append((start, start + pd.Timedelta(days=7) - pd.Timedelta(seconds=1)))
+        start = start + pd.Timedelta(days=7)
+    return weeks
+
+
+def render_planner_view():
+    st.markdown(
+        "<div class='role-banner-planner'>"
+        "<b style='color:#A78BFF;'>📐 PLANNER VIEW</b> &nbsp;·&nbsp; "
+        "Pick a week (or compare two). We aggregate the OpenDSS QSTS solve across the whole "
+        "week, identify chronic stress patterns, and propose ranked capital projects "
+        "— sized in kW with rough cost + payback estimates."
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    weeks = _build_summer_weeks(times)
+    if not weeks:
+        st.error("Dataset doesn't contain any full weeks.")
+        return
+
+    week_labels = [f"Week of {ws.strftime('%a %b %d, %Y')}" for ws, _ in weeks]
+    cw1, cw2, cw3 = st.columns([3, 2, 2])
+    with cw1:
+        pick_week_label = st.selectbox("Week to analyse", week_labels, index=min(2, len(week_labels) - 1))
+    with cw2:
+        scenario_for_planner = st.radio(
+            "Scenario", ["🌤 Baseline", "🔥 Stress (heat + EV)"],
+            index=1, horizontal=True,
+        )
+    with cw3:
+        view_mode = st.radio("Aggregate by", ["Per-day", "Per-hour-of-week"],
+                             index=0, horizontal=True)
+
+    week_idx = week_labels.index(pick_week_label)
+    ws, we = weeks[week_idx]
+
+    # Pick the dataset for this scenario
+    ds_for = ds_stress if "Stress" in scenario_for_planner else ds_base
+
+    # Slice the synthesized loads for this week (use the synthesized "ground
+    # truth" loads_kw rather than the model forecast — for a planner view, we
+    # want a clean unbiased view of how the feeder would perform under the
+    # week's actual demand profile).
+    week_mask = (ds_for.times >= ws) & (ds_for.times <= we)
+    week_times = ds_for.times[week_mask]
+    week_loads = ds_for.loads[:, week_mask]  # [N, T]
+
+    # Reshape to per-day [days, 24, N]
+    n_days = len(week_times) // 24
+    if n_days < 1:
+        st.error("Selected week has fewer than 24 hours of data.")
+        return
+    day_kw = week_loads[:, : n_days * 24].T.reshape(n_days, 24, -1).astype(np.float32)
+    bus_order = tuple(ds_for.bus_order)
+
+    # Solve per-day OpenDSS QSTS (cached)
+    week_label_key = f"{ws.isoformat()}_{scenario_for_planner}"
+    per_day_dicts = _solve_week_truth(
+        day_kw.astype(np.float32).tobytes(),
+        bus_order,
+        day_kw.shape,
+        week_label_key,
+    )
+    per_day_results = [_to_hour_results(d) for d in per_day_dicts]
+
+    # Aggregations
+    weekly_df = aggregate_weekly_violations(per_day_results, list(bus_order))
+    hours_matrix = _bus_day_hours_matrix(per_day_results, list(bus_order))
+    nominal_map = {b: SPOT_LOADS_KW.get(b, 0.0) for b in bus_order}
+    plan_actions = build_planner_actions(weekly_df, nominal_map)
+
+    # Multi-week trend (compute lightweight stats for ALL weeks of the chosen scenario)
+    trend_rows = []
+    for w_start, w_end in weeks:
+        w_mask = (ds_for.times >= w_start) & (ds_for.times <= w_end)
+        if w_mask.sum() < 24:
+            continue
+        # Approximate weekly stress: count "heatwave hours" + sum of synthetic feeder kW peaks
+        wk_temps = ds_for.temp[w_mask]
+        wk_loads = ds_for.loads[:, w_mask].sum(axis=0)  # feeder total per hour
+        trend_rows.append({
+            "week_start": w_start,
+            "total_violation_hours": int((wk_temps >= 41).sum()),  # proxy = heat-stress hours
+            "peak_kw": float(wk_loads.max()) if wk_loads.size else 0.0,
         })
-        st.dataframe(
-            df_display[["Pri.", "Kind", "Where", "When (worst hour)", "Hrs",
-                        "Severity", "Sized kW", "What happened", "Recommended action"]],
-            width="stretch", hide_index=True, height=380,
+    trend_df = pd.DataFrame(trend_rows)
+
+    # Replace the proxy "total_violation_hours" for the *currently selected week* with the
+    # actual computed value, so the trend chart's selected point reflects real physics.
+    actual_total = int(weekly_df["violation_hours_week"].sum())
+    if not trend_df.empty:
+        sel_row = trend_df[trend_df["week_start"] == ws]
+        if not sel_row.empty:
+            trend_df.loc[sel_row.index, "total_violation_hours"] = actual_total
+
+    # ----- Weekly KPIs ----------------------------------------------------- #
+    total_v = int(weekly_df["violation_hours_week"].sum())
+    worst_bus = weekly_df.iloc[0] if not weekly_df.empty else None
+    n_buses_hit = int((weekly_df["violation_hours_week"] > 0).sum())
+    peak_week_kw = float(week_loads.sum(axis=0).max()) if week_loads.size else 0.0
+
+    st.markdown(f"### Week of {ws.strftime('%a %b %d, %Y')} · {scenario_for_planner}")
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Total voltage violations", f"{total_v}",
+              help="Sum of (hour × bus) violations across all 7 days.")
+    if worst_bus is not None and worst_bus["violation_hours_week"] > 0:
+        k2.metric("Worst bus", f"Bus {worst_bus['bus']}",
+                  f"{int(worst_bus['violation_hours_week'])} hr · worst {worst_bus['worst_v_pu']:.3f} pu")
+    else:
+        k2.metric("Worst bus", "—", "no violations")
+    k3.metric("Buses with violations", f"{n_buses_hit} / {len(bus_order)}")
+    k4.metric("Peak weekly load", f"{peak_week_kw:.0f} kW",
+              help="Highest single-hour feeder-total kW across the week.")
+
+    st.divider()
+
+    # ----- Tabs: Heatmap | Top buses | Trend | Capital actions ----------- #
+    tab_hm, tab_top, tab_trend, tab_capex = st.tabs([
+        "🔲  Bus × Day Heatmap", "📊  Top Stressed Buses",
+        "📈  Multi-Week Trend", "🏗  Capital Action Plan",
+    ])
+
+    with tab_hm:
+        if view_mode == "Per-day":
+            day_dates = pd.date_range(ws, periods=n_days, freq="D")
+            st.plotly_chart(violation_heatmap(hours_matrix, day_dates), width="stretch")
+        else:
+            # Per-hour-of-week: 168 columns (7 × 24)
+            big = np.zeros((len(bus_order), n_days * 24), dtype=int)
+            bus_idx = {b: i for i, b in enumerate(bus_order)}
+            for d, day_results in enumerate(per_day_results):
+                for h, hr in enumerate(day_results):
+                    if not hr.converged:
+                        continue
+                    for b, v in hr.bus_voltage_pu.items():
+                        if v is None:
+                            continue
+                        if v < 0.95 or v > 1.05:
+                            big[bus_idx.get(b, 0), d * 24 + h] += 1
+            big_df = pd.DataFrame(big, index=list(bus_order),
+                                  columns=[f"D{d+1}H{h:02d}" for d in range(n_days) for h in range(24)])
+            big_dates = pd.date_range(ws, periods=n_days * 24, freq="h")
+            st.plotly_chart(violation_heatmap(big_df, big_dates), width="stretch")
+
+    with tab_top:
+        st.plotly_chart(top_buses_bar(weekly_df, n=10), width="stretch")
+        with st.expander("Per-bus weekly stats (full table)"):
+            st.dataframe(
+                weekly_df.rename(columns={
+                    "bus": "Bus", "violation_hours_week": "Violation hr/wk",
+                    "worst_v_pu": "Worst V (pu)", "days_with_violation": "Days affected",
+                }),
+                width="stretch", hide_index=True, height=420,
+            )
+
+    with tab_trend:
+        st.plotly_chart(weekly_trend_chart(trend_df), width="stretch")
+        st.caption(
+            "Bars show weekly stress (heat-stress hours per week as a proxy for "
+            "the full season; the selected week shows the actual computed violation "
+            "count from the OpenDSS solve). The seasonal arc tells you whether the "
+            "feeder is degrading earlier each year, or whether DER additions are "
+            "starting to pay off."
         )
 
-    with sub_stress:
-        _render_actions(actions_stress, "stress")
-    with sub_base:
-        _render_actions(actions_base, "baseline")
+    with tab_capex:
+        st.caption(
+            "Capital projects ranked by annualised violation hours × severity. "
+            "Cost and payback are order-of-magnitude estimates: $1,500/kW for "
+            "battery; avoided customer-minute valued at $0.15/min × 20 customers/bus."
+        )
+        if not plan_actions:
+            st.success("No capital projects warranted this week — feeder is operating within limits.")
+        else:
+            df_actions = planner_actions_to_df(plan_actions)
+            df_disp = df_actions.rename(columns={
+                "priority": "Pri.",
+                "bus": "Bus",
+                "kind": "Project type",
+                "suggested_kw": "Size (kW)",
+                "est_cost_usd": "Cost (USD)",
+                "violation_hours_per_week": "Hr/wk now",
+                "violation_hours_per_year": "Hr/yr (annualized)",
+                "worst_v_pu": "Worst V",
+                "n_days_with_violation": "Days affected",
+                "rationale": "Why this project",
+                "payback_years": "Payback (yr)",
+            })
+            # Format cost / payback nicely
+            df_disp["Cost (USD)"] = df_disp["Cost (USD)"].map(lambda x: f"${x:,.0f}")
+            df_disp["Hr/yr (annualized)"] = df_disp["Hr/yr (annualized)"].map(lambda x: f"{x:.0f}")
+            df_disp["Size (kW)"] = df_disp["Size (kW)"].map(lambda x: f"{x:.0f}")
+            df_disp["Worst V"] = df_disp["Worst V"].map(lambda x: f"{x:.3f} pu")
+            df_disp["Payback (yr)"] = df_disp["Payback (yr)"].map(
+                lambda x: f"{x:.1f}" if pd.notna(x) else "n/a")
+            st.dataframe(
+                df_disp[["Pri.", "Bus", "Project type", "Size (kW)", "Cost (USD)",
+                         "Hr/wk now", "Hr/yr (annualized)", "Worst V",
+                         "Days affected", "Payback (yr)", "Why this project"]],
+                width="stretch", hide_index=True, height=420,
+            )
 
-# ---------------- About tab ------------------------------------------------ #
-with tab_about:
-    cab1, cab2 = st.columns([1, 1])
-    with cab1:
-        st.markdown("### Model")
-        st.markdown(
-            f"""
-            - **Architecture**: GraphSAGE (2 layers, 32 hidden) → GRU (64 hidden) → linear head
-            - **Buses**: {len(forecaster.bus_order)} (IEEE 34-bus radial feeder)
-            - **Horizon**: in {forecaster.horizon_in} h → out {forecaster.horizon_out} h
-            - **Trainable parameters**: {forecaster.model.num_parameters():,}
-            """
-        )
-        report_path = REPO / "models" / "checkpoints" / "training_report.json"
-        if report_path.exists():
-            report = json.loads(report_path.read_text())
-            m = report["final_metrics"]
-            st.markdown("**Held-out validation metrics**")
-            mc1, mc2, mc3 = st.columns(3)
-            mc1.metric("Overall RMSE (kW)", f"{m['overall']['rmse']:.2f}")
-            mc1.metric("Overall MAPE (%)", f"{m['overall']['mape']:.1f}")
-            mc2.metric("Heatwave RMSE (kW)", f"{m['heatwave']['rmse']:.2f}")
-            mc2.metric("Heatwave MAPE (%)", f"{m['heatwave']['mape']:.1f}")
-            mc3.metric("Normal RMSE (kW)", f"{m['normal']['rmse']:.2f}")
-            mc3.metric("Normal MAPE (%)", f"{m['normal']['mape']:.1f}")
-            st.caption(f"Trained for {report['epochs']} epochs on {report.get('trainable_params', 'n/a'):,} params.")
-    with cab2:
-        st.markdown("### Data")
-        st.markdown(
-            f"""
-            - **Topology**: IEEE 34-bus radial feeder (NetworkX + OpenDSS deck), Phoenix-area coordinates
-            - **Temperature**: real NOAA NCEI ISD-Lite hourly · KPHX
-            - **Irradiance**: real NREL NSRDB GOES Aggregated v4 · Phoenix
-            - **Per-customer load shapes**: real NREL SMART-DS Austin P1R 2018
-            - **EV stress**: NREL EVI-Pro inspired residential evening curve
-            - **Coverage**: {len(times):,} hourly samples spanning {min(years_available)} – {max(years_available)}
-            """
-        )
-        st.markdown("### How it works")
-        st.markdown(
-            """
-            1. The GNN forecasts 24 h of per-bus load given the past 24 h.
-            2. OpenDSS QSTS solves power flow each hour with regulator/cap state carried across.
-            3. Violations get grouped, severity-ranked, and turned into sized operator actions.
-            4. Subprocess isolation keeps the UI alive even if the OpenDSS native engine SIGILLs.
-            """
-        )
+
+# ================== Render selected role ================================== #
+
+if role.startswith("👷"):
+    render_operator_view()
+else:
+    render_planner_view()
+
+
+# ---------------- Footer --------------------------------------------------- #
 
 st.divider()
 st.caption("Built for the APS / ASU AI for Energy hackathon. "
            "[Source on GitHub](https://github.com/spraka52/aps-feeder-intelligence) · "
-           "real NOAA + NREL NSRDB + NREL SMART-DS data · "
-           "OpenDSS QSTS physics validation.")
+           "real NOAA + NREL NSRDB + NREL ResStock/ComStock data · "
+           "OpenDSS QSTS physics validation · GraphSAGE+GRU forecaster.")
