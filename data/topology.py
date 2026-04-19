@@ -238,6 +238,46 @@ def write_opendss_deck(out_dir: Path, fg: FeederGraph, load_mults: Dict[str, flo
     return master
 
 
+# --- Existing-asset registry -------------------------------------------------
+# Maps each bus to a short, planner-readable description of nearby assets the
+# action engine should reference. This is what an APS planner reaches for
+# *first* before recommending a greenfield install — "do we already have a
+# regulator nearby that we can re-set?"
+EXISTING_ASSETS: Dict[str, Dict] = {
+    "Reg1":   {"bus": "814",  "kind": "voltage_regulator",  "label": "Reg1 @ Bus 814 (32-step, ±10% boost)"},
+    "Reg2":   {"bus": "852",  "kind": "voltage_regulator",  "label": "Reg2 @ Bus 852 (32-step, ±10% boost)"},
+    "XFM_1":  {"bus": "832",  "kind": "transformer",        "label": "In-line 24.9/4.16 kV transformer 832→888"},
+    "Sub":    {"bus": "800",  "kind": "substation",         "label": "Substation transformer 69/24.9 kV @ Bus 800"},
+}
+
+
+def nearby_assets(bus: str, max_hops: int = 4) -> List[Dict]:
+    """Return existing assets within `max_hops` graph hops of `bus`.
+
+    A planner sizing a battery at Bus 890 cares that there's already a 24.9/4.16 kV
+    in-line transformer two hops upstream — that constrains the ride-through
+    time and may mean the right answer is a dual-tap on the transformer instead
+    of a battery. The list is sorted nearest-first.
+    """
+    g = nx.Graph()
+    for u, v, *_ in LINES:
+        g.add_edge(u, v)
+    if bus not in g.nodes:
+        return []
+    try:
+        dists = nx.single_source_shortest_path_length(g, bus, cutoff=max_hops)
+    except Exception:
+        return []
+    out: List[Dict] = []
+    for asset_name, info in EXISTING_ASSETS.items():
+        d = dists.get(info["bus"])
+        if d is None:
+            continue
+        out.append({**info, "name": asset_name, "hops_from_bus": int(d)})
+    out.sort(key=lambda x: x["hops_from_bus"])
+    return out
+
+
 def edge_index_tensor(fg: FeederGraph):
     """Return (edge_index, edge_attr) for PyG.
 

@@ -62,6 +62,11 @@ class HourResult:
     # QSTS-only diagnostics (dict of element-name -> position/state)
     regulator_taps: Dict[str, int] = field(default_factory=dict)
     capacitor_states: Dict[str, int] = field(default_factory=dict)
+    # Per-phase voltages: bus -> [V_A, V_B, V_C] in pu (NaN for phases not present)
+    # Lets the dashboard surface single-phase vs three-phase imbalance — a real
+    # planner needs to know whether overvoltage at Bus 820 is on Phase A only
+    # (re-balance phases) vs all three phases (Volt-VAR / cap bank).
+    bus_voltage_per_phase: Dict[str, List[float]] = field(default_factory=dict)
 
 
 def _ensure_deck() -> Path:
@@ -101,14 +106,21 @@ def _solve_snapshot() -> bool:
 def _collect_results(hour_index: int) -> HourResult:
     import opendssdirect as dss
     bus_v = {}
+    bus_v_phase: Dict[str, List[float]] = {}
     bus_names = dss.Circuit.AllBusNames()
     for b in bus_names:
         dss.Circuit.SetActiveBus(b)
         v_mag_pu = dss.Bus.puVmagAngle()[::2]  # magnitudes only
         if v_mag_pu:
-            v = float(np.mean([x for x in v_mag_pu if x > 0]))
+            valid = [x for x in v_mag_pu if x > 0]
+            v = float(np.mean(valid)) if valid else float("nan")
             if not np.isnan(v) and v > 0:
                 bus_v[b] = v
+                # Pad to 3 phases with NaN for missing phases (single-phase laterals).
+                phase_v = [float(x) if x > 0 else float("nan") for x in v_mag_pu[:3]]
+                while len(phase_v) < 3:
+                    phase_v.append(float("nan"))
+                bus_v_phase[b] = phase_v
 
     line_loading = {}
     dss.Lines.First()
@@ -173,14 +185,55 @@ def _collect_results(hour_index: int) -> HourResult:
         total_losses_kw=float(total_losses_kw),
         regulator_taps=reg_taps,
         capacitor_states=cap_states,
+        bus_voltage_per_phase=bus_v_phase,
     )
 
 
-def _run_horizon_in_process(per_hour_load_kw: np.ndarray, bus_order: List[str]) -> List[HourResult]:
+def _add_injections(inject_kw: Dict[str, float]):
+    """Inject real-power generators at specified buses (counterfactual mitigation).
+
+    Each entry maps bus -> kW of real-power injection (e.g., a battery
+    discharging to support voltage). We model this as an OpenDSS Generator
+    with constant kW output. Negative kW = absorption (rare).
+    """
+    if not inject_kw:
+        return
+    import opendssdirect as dss
+    for bus, kw in inject_kw.items():
+        if abs(kw) < 0.01:
+            continue
+        kv = 4.16 if bus in {"888", "890"} else 24.9
+        # Generator at unity PF — pure real-power support.
+        dss.Text.Command(
+            f"New Generator.WHATIF_{bus} bus1={bus} phases=3 conn=wye "
+            f"kv={kv} kw={kw:.3f} kvar=0 model=1 status=fixed"
+        )
+
+
+def _disable_elements(elements: List[str]):
+    """Open / disable the named elements (N-1 contingency)."""
+    if not elements:
+        return
+    import opendssdirect as dss
+    for el in elements:
+        try:
+            dss.Text.Command(f"Open {el}")
+        except Exception:
+            pass
+
+
+def _run_horizon_in_process(
+    per_hour_load_kw: np.ndarray,
+    bus_order: List[str],
+    inject_kw: Dict[str, float] | None = None,
+    disabled_elements: List[str] | None = None,
+) -> List[HourResult]:
     """In-process snapshot solve — each hour is independent. Used as a fallback
     when QSTS is disabled."""
     deck = _ensure_deck()
     _load_deck(deck)
+    _add_injections(inject_kw or {})
+    _disable_elements(disabled_elements or [])
     results: List[HourResult] = []
 
     nominal = np.array([SPOT_LOADS_KW.get(b, 0.0) for b in bus_order], dtype=float)
@@ -202,7 +255,12 @@ def _run_horizon_in_process(per_hour_load_kw: np.ndarray, bus_order: List[str]) 
     return results
 
 
-def _run_horizon_qsts(per_hour_load_kw: np.ndarray, bus_order: List[str]) -> List[HourResult]:
+def _run_horizon_qsts(
+    per_hour_load_kw: np.ndarray,
+    bus_order: List[str],
+    inject_kw: Dict[str, float] | None = None,
+    disabled_elements: List[str] | None = None,
+) -> List[HourResult]:
     """Quasi-static time-series (QSTS) solve.
 
     Defines a Loadshape per load with the forecast multipliers, then advances
@@ -214,6 +272,8 @@ def _run_horizon_qsts(per_hour_load_kw: np.ndarray, bus_order: List[str]) -> Lis
     import opendssdirect as dss
     deck = _ensure_deck()
     _load_deck(deck)
+    _add_injections(inject_kw or {})
+    _disable_elements(disabled_elements or [])
 
     nominal = np.array([SPOT_LOADS_KW.get(b, 0.0) for b in bus_order], dtype=float)
     safe_nom = np.where(nominal > 0, nominal, 1.0)
@@ -256,6 +316,7 @@ def _hourresult_to_dict(r: HourResult) -> dict:
         "total_losses_kw": r.total_losses_kw,
         "regulator_taps": r.regulator_taps,
         "capacitor_states": r.capacitor_states,
+        "bus_voltage_per_phase": r.bus_voltage_per_phase,
     }
 
 
@@ -269,15 +330,22 @@ def run_forecast_horizon(
     use_subprocess: bool = True,
     timeout_s: float = 60.0,
     mode: str = "qsts",
+    inject_kw: Dict[str, float] | None = None,
+    disabled_elements: List[str] | None = None,
 ) -> List[HourResult]:
     """Run OpenDSS for each forecast hour.
 
-    per_hour_load_kw: shape [T_out, N] — predicted kW per bus.
-    bus_order:        list of length N matching the predictor.
-    mode:             "qsts" (default, recommended) — daily-mode time-series
-                       so regulator/cap controls evolve across hours.
-                      "snapshot" — independent snapshot solve per hour
-                       (kept for comparison / debugging).
+    per_hour_load_kw:  shape [T_out, N] — predicted kW per bus.
+    bus_order:         list of length N matching the predictor.
+    mode:              "qsts" (default) — daily-mode QSTS, regulators evolve.
+                       "snapshot" — independent snapshot per hour.
+    inject_kw:         optional bus -> kW dict. Each entry adds a constant-kW
+                       Generator at that bus, modelling a battery discharge or
+                       a Volt-VAR program's net real-power offset for
+                       counterfactual "what-if I deploy this action?" runs.
+    disabled_elements: optional list of OpenDSS elements to Open before solving
+                       (e.g., ["Transformer.Reg2", "Line.L_832_858"]) for N-1
+                       contingency analysis.
 
     By default each call runs in a fresh `python -m physics._solver_worker`
     subprocess so a SIGILL inside the OpenDSS native engine never crashes
@@ -287,13 +355,19 @@ def run_forecast_horizon(
     """
     if not use_subprocess:
         if mode == "qsts":
-            return _run_horizon_qsts(per_hour_load_kw, bus_order)
-        return _run_horizon_in_process(per_hour_load_kw, bus_order)
+            return _run_horizon_qsts(per_hour_load_kw, bus_order,
+                                      inject_kw=inject_kw,
+                                      disabled_elements=disabled_elements)
+        return _run_horizon_in_process(per_hour_load_kw, bus_order,
+                                        inject_kw=inject_kw,
+                                        disabled_elements=disabled_elements)
 
     payload = pickle.dumps({
         "forecast_kw": np.ascontiguousarray(per_hour_load_kw, dtype=np.float64),
         "bus_order": list(bus_order),
         "mode": mode,
+        "inject_kw": dict(inject_kw or {}),
+        "disabled_elements": list(disabled_elements or []),
     })
 
     cmd = [sys.executable, "-m", "physics._solver_worker"]
@@ -327,6 +401,71 @@ def run_forecast_horizon(
     return [_dict_to_hourresult(d) for d in out]
 
 
+def compute_hosting_capacity(
+    bus_order: List[str],
+    nominal_kw_per_bus: Dict[str, float],
+    test_pv_kw: float = 200.0,
+) -> Dict[str, float]:
+    """Estimate per-bus PV hosting headroom (kW until any voltage hits 1.05 pu).
+
+    APS is required by the Arizona Corporation Commission to publish
+    hosting-capacity maps for every feeder. This function exploits the
+    near-linear V vs PV-injection relationship at a single bus to compute
+    headroom in 2 N + 1 OpenDSS solves rather than a brute-force sweep.
+
+    Returns a dict {bus -> headroom_kw}. Buses already over 1.05 pu return 0.
+    """
+    deck = _ensure_deck()
+    _load_deck(deck)
+    nominal = np.array([nominal_kw_per_bus.get(b, 0.0) for b in bus_order], dtype=float)
+    safe_nom = np.where(nominal > 0, nominal, 1.0)
+
+    # Baseline solve at nominal load — this is the "starting point" for V.
+    mults = {b: 1.0 for b in bus_order if nominal_kw_per_bus.get(b, 0.0) > 0}
+    _set_load_multipliers(mults)
+    _solve_snapshot()
+    base = _collect_results(0)
+    v_base = base.bus_voltage_pu
+
+    import opendssdirect as dss
+    headroom: Dict[str, float] = {}
+    for bus in bus_order:
+        if bus not in v_base:
+            continue
+        v0 = v_base[bus]
+        # Inject `test_pv_kw` of PV (negative load) at this bus, re-solve,
+        # measure ΔV, then back out headroom to 1.05 pu by linear extrapolation.
+        # Unique generator names per iteration so OpenDSS doesn't warn about
+        # duplicate element definitions (which the CFFI binding promotes to error).
+        gen_name = f"HC_{bus}"
+        dss.Text.Command(
+            f"New Generator.{gen_name} bus1={bus} phases=3 conn=wye "
+            f"kv={4.16 if bus in {'888','890'} else 24.9} "
+            f"kw={test_pv_kw:.3f} kvar=0 model=1 status=fixed"
+        )
+        dss.Solution.Solve()
+        ok = dss.Solution.Converged()
+        if ok:
+            r = _collect_results(0)
+            v_new = r.bus_voltage_pu.get(bus, v0)
+            dV = v_new - v0
+            slope = dV / max(test_pv_kw, 1.0)  # pu per kW
+            if slope <= 0:  # injection didn't raise voltage — unbounded headroom
+                headroom[bus] = float("inf")
+            else:
+                hr_kw = max(0.0, (VMAX_PU - v0) / slope)
+                # Cap at a sensible 5 MW per single-phase tap
+                headroom[bus] = float(min(hr_kw, 5000.0))
+        else:
+            headroom[bus] = 0.0
+        # Disable the test generator before moving to the next bus
+        try:
+            dss.Text.Command(f"Disable Generator.{gen_name}")
+        except Exception:
+            pass
+    return headroom
+
+
 def _empty_results(n: int) -> List[HourResult]:
     return [
         HourResult(
@@ -335,6 +474,40 @@ def _empty_results(n: int) -> List[HourResult]:
         )
         for t in range(n)
     ]
+
+
+def run_hosting_capacity_subprocess(
+    bus_order: List[str],
+    nominal_kw_per_bus: Dict[str, float],
+    test_pv_kw: float = 200.0,
+    timeout_s: float = 90.0,
+) -> Dict[str, float]:
+    """Run hosting-capacity computation in a subprocess (for crash isolation)."""
+    payload = pickle.dumps({
+        "mode": "hosting_capacity",
+        "bus_order": list(bus_order),
+        "nominal_kw_per_bus": dict(nominal_kw_per_bus),
+        "test_pv_kw": float(test_pv_kw),
+    })
+    cmd = [sys.executable, "-m", "physics._solver_worker"]
+    try:
+        completed = subprocess.run(
+            cmd, input=payload, capture_output=True,
+            timeout=timeout_s, cwd=str(REPO), check=False,
+        )
+    except subprocess.TimeoutExpired:
+        print("[hosting_capacity] subprocess timed out", file=sys.stderr)
+        return {}
+    if completed.returncode != 0:
+        err = completed.stderr.decode("utf-8", errors="replace")[-500:]
+        print(f"[hosting_capacity] subprocess exit={completed.returncode}; stderr:\n{err}",
+              file=sys.stderr)
+        return {}
+    try:
+        return pickle.loads(completed.stdout)
+    except Exception as e:
+        print(f"[hosting_capacity] failed to unpickle: {e}", file=sys.stderr)
+        return {}
 
 
 def summarize(results: List[HourResult]) -> dict:

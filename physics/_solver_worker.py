@@ -23,9 +23,23 @@ if str(ROOT) not in sys.path:
 
 def main():
     payload = pickle.loads(sys.stdin.buffer.read())
-    arr = payload["forecast_kw"]
     bus_order = payload["bus_order"]
     mode = payload.get("mode", "qsts")
+
+    if mode == "hosting_capacity":
+        from physics.opendss_runner import compute_hosting_capacity
+        out = compute_hosting_capacity(
+            bus_order,
+            payload.get("nominal_kw_per_bus") or {},
+            test_pv_kw=float(payload.get("test_pv_kw", 200.0)),
+        )
+        sys.stdout.buffer.write(pickle.dumps(out))
+        sys.stdout.buffer.flush()
+        return
+
+    arr = payload["forecast_kw"]
+    inject_kw = payload.get("inject_kw") or {}
+    disabled_elements = payload.get("disabled_elements") or []
 
     from physics.opendss_runner import (
         _run_horizon_in_process,
@@ -33,7 +47,8 @@ def main():
         _hourresult_to_dict,
     )
     runner = _run_horizon_qsts if mode == "qsts" else _run_horizon_in_process
-    results = runner(arr, bus_order)
+    results = runner(arr, bus_order, inject_kw=inject_kw,
+                     disabled_elements=disabled_elements)
     out = [_hourresult_to_dict(r) for r in results]
     sys.stdout.buffer.write(pickle.dumps(out))
     sys.stdout.buffer.flush()

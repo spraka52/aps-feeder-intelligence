@@ -55,3 +55,51 @@ class Forecaster:
         with torch.no_grad():
             yhat = self.model(X, self.edge_index).numpy()[0]  # [T_out, N]
         return np.clip(yhat, 0.0, None)
+
+    def forecast_window_with_uncertainty(
+        self, ds: FeederWindowDataset, t0: int, n_samples: int = 20,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Forecast + uncertainty band via Monte-Carlo dropout.
+
+        Standard inference disables dropout (model.eval()) and emits a single
+        point forecast. For planning-grade decisions a planner needs to know
+        *how confident* the model is — a 245 kW peak forecast is useless if
+        the 95% interval is [180, 320].
+
+        Method: switch dropout layers ON at inference, run K = `n_samples`
+        forward passes, and treat the empirical mean / std across samples
+        as the predictive distribution (Gal & Ghahramani 2016, "Dropout as
+        a Bayesian Approximation").
+
+        Returns
+        -------
+        mean : ndarray  [horizon_out, N]
+            Per-bus per-hour mean forecast (kW).
+        p10  : ndarray  [horizon_out, N]
+            10th percentile lower band.
+        p90  : ndarray  [horizon_out, N]
+            90th percentile upper band.
+        """
+        N = len(self.bus_order)
+        Xs = np.stack([ds._features_at(t0 + k, N) for k in range(self.horizon_in)], axis=0)
+        X = torch.from_numpy(Xs[None, ...])
+
+        # Force dropout layers on while keeping batchnorm in eval mode.
+        self.model.train()
+        for m in self.model.modules():
+            if isinstance(m, torch.nn.BatchNorm1d):
+                m.eval()
+        try:
+            samples = []
+            with torch.no_grad():
+                for _ in range(int(n_samples)):
+                    yhat = self.model(X, self.edge_index).numpy()[0]
+                    samples.append(np.clip(yhat, 0.0, None))
+        finally:
+            self.model.eval()
+
+        arr = np.stack(samples, axis=0)  # [K, T, N]
+        mean = arr.mean(axis=0)
+        p10 = np.percentile(arr, 10, axis=0)
+        p90 = np.percentile(arr, 90, axis=0)
+        return mean, p10, p90

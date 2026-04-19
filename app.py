@@ -25,7 +25,7 @@ from decisions.planner_actions import (
 )
 from models.dataset import FeederWindowDataset, WindowSpec
 from models.predict import Forecaster
-from physics.opendss_runner import run_forecast_horizon
+from physics.opendss_runner import run_forecast_horizon, run_hosting_capacity_subprocess
 
 
 REPO = Path(__file__).resolve().parent
@@ -75,6 +75,60 @@ def _solve(forecast_kw_bytes: bytes, bus_order: tuple, shape: tuple) -> List[dic
     forecast_kw = np.frombuffer(forecast_kw_bytes, dtype=np.float32).reshape(shape)
     results = run_forecast_horizon(forecast_kw, list(bus_order))
     return [_hourresult_to_dict(r) for r in results]
+
+
+@st.cache_data(show_spinner="Re-solving with counterfactual injection…")
+def _solve_counterfactual(forecast_kw_bytes: bytes, bus_order: tuple,
+                          shape: tuple, inject_kw_items: tuple) -> List[dict]:
+    """Re-run OpenDSS with mitigation generators injected at named buses.
+
+    `inject_kw_items` is a tuple of (bus, kw) tuples so it's hashable for
+    Streamlit's cache.
+    """
+    from physics.opendss_runner import _hourresult_to_dict
+    forecast_kw = np.frombuffer(forecast_kw_bytes, dtype=np.float32).reshape(shape)
+    inject = {b: float(k) for b, k in inject_kw_items}
+    results = run_forecast_horizon(forecast_kw, list(bus_order), inject_kw=inject)
+    return [_hourresult_to_dict(r) for r in results]
+
+
+@st.cache_data(show_spinner="Re-solving with element outage…")
+def _solve_contingency(forecast_kw_bytes: bytes, bus_order: tuple,
+                       shape: tuple, disabled_elements: tuple) -> List[dict]:
+    from physics.opendss_runner import _hourresult_to_dict
+    forecast_kw = np.frombuffer(forecast_kw_bytes, dtype=np.float32).reshape(shape)
+    results = run_forecast_horizon(
+        forecast_kw, list(bus_order),
+        disabled_elements=list(disabled_elements),
+    )
+    return [_hourresult_to_dict(r) for r in results]
+
+
+@st.cache_data(show_spinner="Computing per-bus hosting capacity…")
+def _hosting_capacity(bus_order: tuple, nominal_items: tuple) -> dict:
+    nominal = {b: float(k) for b, k in nominal_items}
+    return run_hosting_capacity_subprocess(list(bus_order), nominal)
+
+
+# Reference EV penetration in our two synthesized datasets (used to interpolate
+# arbitrary EV adoption percentages without retraining the forecaster).
+EV_PCT_BASE = 0.0
+EV_PCT_STRESS = 35.0
+
+
+def interpolate_loads(base_kw: np.ndarray, stress_kw: np.ndarray,
+                      target_ev_pct: float) -> np.ndarray:
+    """Linearly interpolate between baseline (0% EV) and stress (35% EV) to
+    approximate an arbitrary EV adoption percentage.
+
+    For target_ev_pct = 0   → returns baseline
+    For target_ev_pct = 35  → returns stress
+    For target_ev_pct = 50  → extrapolates beyond stress (scale = 50/35)
+    Output is clipped to non-negative.
+    """
+    scale = float(target_ev_pct) / EV_PCT_STRESS
+    out = base_kw + scale * (stress_kw - base_kw)
+    return np.clip(out, 0.0, None).astype(np.float32)
 
 
 def _to_hour_results(dicts: List[dict]):
@@ -429,11 +483,27 @@ def _layout(title: str, **overrides) -> dict:
     return base
 
 
-def horizon_chart(forecast_kw_b: np.ndarray, forecast_kw_s: np.ndarray, times) -> go.Figure:
+def horizon_chart(
+    forecast_kw_b: np.ndarray, forecast_kw_s: np.ndarray, times,
+    p10_s: np.ndarray | None = None, p90_s: np.ndarray | None = None,
+) -> go.Figure:
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=list(times), y=forecast_kw_b.sum(axis=1),
                              mode="lines+markers", name="Baseline",
                              line=dict(width=2, color=COLOR["baseline"]), marker=dict(size=4)))
+    # Optional 80% confidence band on the stress forecast (MC dropout)
+    if p10_s is not None and p90_s is not None:
+        fig.add_trace(go.Scatter(
+            x=list(times), y=p90_s.sum(axis=1),
+            mode="lines", line=dict(width=0, color=COLOR["stress"]),
+            name="P90", showlegend=False, hoverinfo="skip",
+        ))
+        fig.add_trace(go.Scatter(
+            x=list(times), y=p10_s.sum(axis=1),
+            mode="lines", line=dict(width=0, color=COLOR["stress"]),
+            fill="tonexty", fillcolor="rgba(184, 85, 37, 0.15)",
+            name="80 % CI (P10–P90)", hoverinfo="skip",
+        ))
     fig.add_trace(go.Scatter(x=list(times), y=forecast_kw_s.sum(axis=1),
                              mode="lines+markers", name="Stress · heat + EV",
                              line=dict(width=2, color=COLOR["stress"]), marker=dict(size=4)))
@@ -909,9 +979,22 @@ def render_operator_view():
     fcst_times = times[t0 + forecaster.horizon_in : t0 + forecaster.horizon_in + forecaster.horizon_out]
     hw_in_window = int(ds_base.heatwave[t0 + forecaster.horizon_in : t0 + forecaster.horizon_in + forecaster.horizon_out].sum())
 
+    # ---- EV adoption slider (interpolates between baseline and stress) ---- #
+    ev_options = [0, 10, 20, 35, 50, 60]
+    ev_pct = st.select_slider(
+        "EV adoption on this feeder (%)",
+        options=ev_options, value=35,
+        help="Linearly interpolates load between today's baseline (0%) and "
+             "the 2030 stress scenario (35% EV). Above 35% extrapolates "
+             "beyond the dataset's training range.",
+    )
+    ev_label = ("Today's load (no EV)" if ev_pct == 0 else
+                "2030 stress" if ev_pct == 35 else f"Custom · {ev_pct}% EV")
+
     st.markdown(
         f"<div class='scenario-banner'>"
         f"<b>{scenario_label}</b> &nbsp;·&nbsp; "
+        f"<b>{ev_label}</b> &nbsp;·&nbsp; "
         f"horizon: {fcst_times[0].strftime('%a %b %d, %H:%M')} → "
         f"{fcst_times[-1].strftime('%a %b %d, %H:%M')} &nbsp;·&nbsp; "
         f"<b>{hw_in_window}/24</b> heatwave hours in window"
@@ -920,9 +1003,13 @@ def render_operator_view():
     )
 
     # Run forecasts + OpenDSS
-    fcst_base = forecaster.forecast_window(ds_base, t0)
-    fcst_stress = forecaster.forecast_window(ds_stress, t0)
+    fcst_base_raw = forecaster.forecast_window(ds_base, t0)
+    fcst_stress_raw = forecaster.forecast_window(ds_stress, t0)
     bus_order = tuple(forecaster.bus_order)
+
+    # Interpolate the forecast to the user's chosen EV %
+    fcst_base = fcst_base_raw  # keep base unchanged for comparison
+    fcst_stress = interpolate_loads(fcst_base_raw, fcst_stress_raw, ev_pct)
 
     res_base_d = _solve(fcst_base.astype(np.float32).tobytes(), bus_order, fcst_base.shape)
     res_stress_d = _solve(fcst_stress.astype(np.float32).tobytes(), bus_order, fcst_stress.shape)
@@ -945,6 +1032,107 @@ def render_operator_view():
         first_hour = pd.Timestamp(top["when"])
         hours_until = max(0, int((first_hour - fcst_times[0]).total_seconds() // 3600))
         urgency = "Take action now" if hours_until <= 1 else f"Pre-position in {hours_until} hours"
+
+        # ---- Counterfactual: re-solve with this action's injection ---- #
+        action_bus = str(top["bus_or_line"])
+        action_kw  = float(top["target_kw"]) if pd.notna(top["target_kw"]) else 0.0
+        # Treat undervoltage actions as +kW (battery discharge), overvoltage as -kW (curtailment)
+        action_kind = str(top["kind"])
+        if "overvoltage" in action_kind.lower():
+            action_kw = -abs(action_kw)
+        else:
+            action_kw = abs(action_kw)
+
+        # ---- Phase imbalance detector ---- #
+        phase_block = ""
+        if action_bus.isdigit():
+            # Find the hour where this bus's voltage is most extreme
+            v_per_hour = [r.bus_voltage_pu.get(action_bus) for r in res_stress]
+            v_clean = [(h, v) for h, v in enumerate(v_per_hour) if v is not None]
+            if v_clean:
+                if "overvoltage" in action_kind.lower():
+                    worst_h = max(v_clean, key=lambda x: x[1])[0]
+                else:
+                    worst_h = min(v_clean, key=lambda x: x[1])[0]
+                phases_raw = res_stress[worst_h].bus_voltage_per_phase.get(action_bus, [])
+                phases = [v for v in phases_raw if v is not None and not (isinstance(v, float) and np.isnan(v))]
+                if len(phases) >= 2:
+                    avg = float(np.mean(phases))
+                    max_dev = max(abs(v - avg) for v in phases)
+                    imb_pct = (max_dev / avg) * 100.0 if avg > 0 else 0.0
+                    is_imbalanced = imb_pct > 2.0
+                    diag_color = COLOR["warn"] if is_imbalanced else COLOR["ok"]
+                    diag_label = ("Phase imbalance > 2 % — re-balance loads first"
+                                  if is_imbalanced else
+                                  "Three phases tracking together (< 2 % spread)")
+                    phase_str = "  ·  ".join(
+                        f"{name}={v:.3f}" for name, v in zip(["Va", "Vb", "Vc"], phases)
+                    )
+                    phase_block = (
+                        f"<div style='margin-top:14px; padding:10px 14px; "
+                        f"background:#FFFFFF; border:1px solid {COLOR['border']}; "
+                        f"border-left:3px solid {diag_color}; border-radius:3px;'>"
+                        f"<div style='font-size:0.72rem; color:{COLOR['text_dim']}; "
+                        f"text-transform:uppercase; letter-spacing:0.06em; font-weight:600; margin-bottom:6px;'>"
+                        f"Phase voltages at worst hour · Bus {action_bus}</div>"
+                        f"<div style='font-size:0.92rem; color:{COLOR['text']}; font-feature-settings:\"tnum\" 1;'>"
+                        f"{phase_str} pu  &nbsp;·&nbsp; "
+                        f"imbalance <b>{imb_pct:.1f} %</b></div>"
+                        f"<div style='font-size:0.82rem; color:{diag_color}; "
+                        f"font-weight:600; margin-top:4px;'>{diag_label}</div>"
+                        f"</div>"
+                    )
+
+        cf_block = ""
+        if action_kw != 0.0 and action_bus.isdigit():
+            try:
+                cf_dicts = _solve_counterfactual(
+                    fcst_stress.astype(np.float32).tobytes(),
+                    bus_order, fcst_stress.shape,
+                    ((action_bus, action_kw),),
+                )
+                cf_results = _to_hour_results(cf_dicts)
+                # Compare worst voltage at the action bus across the horizon
+                v_before = [r.bus_voltage_pu.get(action_bus) for r in res_stress]
+                v_after  = [r.bus_voltage_pu.get(action_bus) for r in cf_results]
+                v_before_clean = [v for v in v_before if v is not None]
+                v_after_clean  = [v for v in v_after if v is not None]
+                if v_before_clean and v_after_clean:
+                    worst_before = min(v_before_clean) if "overvoltage" not in action_kind.lower() else max(v_before_clean)
+                    worst_after  = min(v_after_clean)  if "overvoltage" not in action_kind.lower() else max(v_after_clean)
+                    n_v_before = sum(len(r.voltage_violations) for r in res_stress)
+                    n_v_after  = sum(len(r.voltage_violations) for r in cf_results)
+
+                    fixed = (worst_before < 0.95 and worst_after >= 0.95) or \
+                            (worst_before > 1.05 and worst_after <= 1.05)
+                    arrow_color = COLOR["ok"] if fixed else (
+                        COLOR["warn"] if abs(worst_after - 1.0) < abs(worst_before - 1.0) else COLOR["alert"])
+                    fix_label = ("Fix confirmed — within band" if fixed else
+                                 "Partial mitigation — outside band" if abs(worst_after - 1.0) >= 0.05 else
+                                 "Significant improvement")
+
+                    cf_block = (
+                        f"<div style='margin-top:14px; padding:12px 14px; "
+                        f"background:#FFFFFF; border:1px solid {COLOR['border']}; "
+                        f"border-left:3px solid {arrow_color}; border-radius:3px;'>"
+                        f"<div style='font-size:0.72rem; color:{COLOR['text_dim']}; "
+                        f"text-transform:uppercase; letter-spacing:0.06em; font-weight:600; margin-bottom:6px;'>"
+                        f"Counterfactual · what if we deploy this {abs(action_kw):.0f} kW action?</div>"
+                        f"<div style='font-size:0.95rem; color:{COLOR['text']};'>"
+                        f"Bus {action_bus} worst voltage: "
+                        f"<b>{worst_before:.3f} pu</b> → "
+                        f"<b style='color:{arrow_color};'>{worst_after:.3f} pu</b> "
+                        f"&nbsp;·&nbsp; "
+                        f"Feeder violations: <b>{n_v_before}</b> → "
+                        f"<b style='color:{arrow_color};'>{n_v_after}</b>"
+                        f"</div>"
+                        f"<div style='font-size:0.82rem; color:{arrow_color}; "
+                        f"font-weight:600; margin-top:4px;'>{fix_label}</div>"
+                        f"</div>"
+                    )
+            except Exception:
+                cf_block = ""
+
         st.markdown(
             f"""
             <div class='priority-card'>
@@ -956,6 +1144,8 @@ def render_operator_view():
                 {int(top['hours_affected'])} hours affected ·
                 severity {float(top['severity']):.2f}
               </div>
+              {phase_block}
+              {cf_block}
             </div>
             """,
             unsafe_allow_html=True,
@@ -1041,7 +1231,41 @@ def render_operator_view():
             )
 
     with tab_forecast:
-        st.plotly_chart(horizon_chart(fcst_base, fcst_stress, fcst_times), width="stretch")
+        show_ci = st.toggle(
+            "Show forecast uncertainty (80 % CI via Monte-Carlo dropout)",
+            value=False,
+            help="Runs the model 20× with dropout enabled and shades the "
+                 "P10–P90 band. Adds ~1 s to the render. A planner sizing "
+                 "infrastructure should look at the upper band, not the median.",
+        )
+        p10_s = p90_s = None
+        if show_ci:
+            try:
+                _mean, p10_s, p90_s = forecaster.forecast_window_with_uncertainty(
+                    ds_stress, t0, n_samples=20,
+                )
+                # Apply the same EV interpolation to the bands
+                p10_s = interpolate_loads(fcst_base_raw, p10_s, ev_pct)
+                p90_s = interpolate_loads(fcst_base_raw, p90_s, ev_pct)
+            except Exception as e:
+                st.warning(f"Uncertainty computation failed: {e}")
+
+        st.plotly_chart(
+            horizon_chart(fcst_base, fcst_stress, fcst_times, p10_s, p90_s),
+            width="stretch",
+        )
+        if show_ci and p10_s is not None and p90_s is not None:
+            peak_p50 = float(fcst_stress.sum(axis=1).max())
+            peak_p10 = float(p10_s.sum(axis=1).max())
+            peak_p90 = float(p90_s.sum(axis=1).max())
+            band = (peak_p90 - peak_p10) / max(peak_p50, 1.0) * 100.0
+            st.caption(
+                f"**Peak feeder forecast:** {peak_p50:.0f} kW (median)  ·  "
+                f"P10 {peak_p10:.0f} kW  ·  P90 {peak_p90:.0f} kW  ·  "
+                f"band ≈ {band:.0f} % of median. Size infrastructure to P90 "
+                f"unless you have a clear over-build cost reason not to."
+            )
+
         cf1, cf2 = st.columns(2)
         with cf1:
             st.plotly_chart(violations_chart(res_base, res_stress, fcst_times), width="stretch")
@@ -1165,10 +1389,10 @@ def _build_summer_weeks(times: pd.DatetimeIndex) -> List[Tuple[pd.Timestamp, pd.
 def render_planner_view():
     st.markdown(
         f"<div class='role-banner-planner'>"
-        f"<b style='color:#A78BFF;'>PLANNER VIEW</b> &nbsp; "
+        f"<b style='color:#6E5BB0;'>PLANNER VIEW</b> &nbsp; "
         f"Pick a week. We aggregate the OpenDSS QSTS solve across the whole "
         f"week, identify chronic stress patterns, and propose ranked capital projects "
-        f"— sized in kW with rough cost + payback estimates."
+        f"with realistic cost ranges, customer SAIDI footprint, and escalation triggers."
         f"</div>",
         unsafe_allow_html=True,
     )
@@ -1184,17 +1408,35 @@ def render_planner_view():
         pick_week_label = st.selectbox("Week to analyse", week_labels, index=min(2, len(week_labels) - 1))
     with cw2:
         scenario_for_planner = st.radio(
-            "Scenario", ["Baseline", "Stress · heat + EV"],
+            "Scenario",
+            ["Today's mix (10% PV)", "2030 stress (heat + 35% EV + 10% PV)"],
             index=1, horizontal=True,
+            help="'Today's mix' is the present feeder with existing 10% PV penetration and no EV uptake. "
+                 "'2030 stress' adds 35% residential EV at evening peak.",
         )
 
     week_idx = week_labels.index(pick_week_label)
     ws, we = weeks[week_idx]
 
-    ds_for = ds_stress if "Stress" in scenario_for_planner else ds_base
-    week_mask = (ds_for.times >= ws) & (ds_for.times <= we)
-    week_times = ds_for.times[week_mask]
-    week_loads = ds_for.loads[:, week_mask]
+    is_stress = "stress" in scenario_for_planner.lower() or "2030" in scenario_for_planner
+
+    # EV slider — interpolates between today's mix (0% EV) and 2030 stress (35% EV)
+    ev_options = [0, 10, 20, 35, 50, 60]
+    default_ev = 35 if is_stress else 0
+    planner_ev_pct = st.select_slider(
+        "EV adoption on this feeder (%)",
+        options=ev_options, value=default_ev,
+        help="Set above 35% to project beyond the 2030 stress case. "
+             "Useful for 'what does the feeder look like at 50% EV in 2035?'",
+    )
+
+    week_mask_base = (ds_base.times >= ws) & (ds_base.times <= we)
+    week_times = ds_base.times[week_mask_base]
+    week_loads_base = ds_base.loads[:, week_mask_base]
+    week_loads_stress = ds_stress.loads[:, week_mask_base]
+    week_loads = interpolate_loads(week_loads_base, week_loads_stress, planner_ev_pct)
+    ds_for = ds_base  # times / heatwave bookkeeping comes from base
+    week_times = ds_for.times[week_mask_base]
 
     n_days = len(week_times) // 24
     if n_days < 1:
@@ -1203,7 +1445,7 @@ def render_planner_view():
     day_kw = week_loads[:, : n_days * 24].T.reshape(n_days, 24, -1).astype(np.float32)
     bus_order = tuple(ds_for.bus_order)
 
-    week_label_key = f"{ws.isoformat()}_{scenario_for_planner}"
+    week_label_key = f"{ws.isoformat()}_ev{planner_ev_pct}"
     per_day_dicts = _solve_week_truth(
         day_kw.astype(np.float32).tobytes(),
         bus_order, day_kw.shape, week_label_key,
@@ -1251,11 +1493,49 @@ def render_planner_view():
     k3.metric("Buses with violations", f"{n_buses_hit} / {len(bus_order)}")
     k4.metric("Peak weekly load", f"{peak_week_kw:.0f} kW")
 
+    # ----- Feeder summary card (planner-grade rollup) ----- #
+    capex_low  = sum(getattr(a, "cost_low_usd", 0.0) for a in plan_actions if a.kind != "monitor")
+    capex_high = sum(getattr(a, "cost_high_usd", 0.0) for a in plan_actions if a.kind != "monitor")
+    saidi_total = sum(getattr(a, "saidi_minutes_year", 0.0) for a in plan_actions)
+    customers_total = sum(getattr(a, "customers_affected", 0) for a in plan_actions if a.kind != "monitor")
+    n_capex = sum(1 for a in plan_actions if a.kind != "monitor")
+    n_monitor = sum(1 for a in plan_actions if a.kind == "monitor")
+    avoided_year = sum(getattr(a, "avoided_outage_usd_year", 0.0) for a in plan_actions)
+
+    st.markdown(
+        f"""
+        <div style="background:{COLOR['bg_card']}; border:1px solid {COLOR['border']};
+                    border-left:3px solid {COLOR['accent']}; border-radius:4px;
+                    padding:0.95rem 1.15rem; margin-top:0.8rem;">
+          <div style="font-size:0.74rem; color:{COLOR['text_dim']}; text-transform:uppercase;
+                      letter-spacing:0.06em; font-weight:600; margin-bottom:6px;">
+            Feeder rollup · IEEE 34-bus radial
+          </div>
+          <div style="display:flex; gap:36px; flex-wrap:wrap; font-size:0.92rem;">
+            <div><b style="color:{COLOR['text']}; font-size:1.05rem;">{n_capex}</b>
+              <span style="color:{COLOR['text_dim']};"> capital actions</span>
+              · <b style="color:{COLOR['text']}; font-size:1.05rem;">{n_monitor}</b>
+              <span style="color:{COLOR['text_dim']};"> on watch list</span></div>
+            <div><span style="color:{COLOR['text_dim']};">Capex range:</span>
+              <b style="color:{COLOR['text']};">${capex_low/1000:,.0f}k – ${capex_high/1000:,.0f}k</b></div>
+            <div><span style="color:{COLOR['text_dim']};">Customers covered:</span>
+              <b style="color:{COLOR['text']};">{customers_total}</b></div>
+            <div><span style="color:{COLOR['text_dim']};">SAIDI improvement:</span>
+              <b style="color:{COLOR['text']};">{saidi_total/max(customers_total,1):.0f} min/customer/yr</b></div>
+            <div><span style="color:{COLOR['text_dim']};">Annual avoided cost:</span>
+              <b style="color:{COLOR['text']};">${avoided_year:,.0f}</b></div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
     st.markdown("")
 
-    tab_hm, tab_top, tab_trend, tab_capex = st.tabs([
+    tab_hm, tab_top, tab_trend, tab_hc, tab_ctg, tab_capex = st.tabs([
         "Bus × Day Heatmap", "Top Stressed Buses",
-        "Multi-Week Trend", "Capital Action Plan",
+        "Multi-Week Trend", "Hosting Capacity", "N-1 Contingency",
+        "Capital Action Plan",
     ])
 
     with tab_hm:
@@ -1290,13 +1570,135 @@ def render_planner_view():
             "other weeks show heat-stress hours per week as a proxy for the full season."
         )
 
+    with tab_hc:
+        st.markdown(
+            "Per-bus PV **hosting headroom** — additional kW of solar a customer "
+            "could install at each bus before the bus voltage hits the 1.05 pu "
+            "limit. Required by the Arizona Corporation Commission as part of "
+            "every utility's annual hosting-capacity filing."
+        )
+        nominal_items = tuple(sorted(SPOT_LOADS_KW.items()))
+        hc_dict = _hosting_capacity(tuple(bus_order), nominal_items)
+        if not hc_dict:
+            st.warning("Hosting capacity solve did not converge.")
+        else:
+            # Replace inf with 5000 so the chart renders sensibly
+            hc_clean = {b: (5000.0 if v == float("inf") else float(v)) for b, v in hc_dict.items()}
+            df_hc = pd.DataFrame([
+                {"Bus": b, "Headroom (kW)": v, "Status": (
+                    "Constrained (< 100 kW)" if v < 100 else
+                    "Limited (100–500 kW)" if v < 500 else
+                    "Comfortable (500–1500 kW)" if v < 1500 else
+                    "Unbounded (regulator absorbs PV)"
+                )} for b, v in hc_clean.items()
+            ]).sort_values("Headroom (kW)").reset_index(drop=True)
+
+            color_map = {
+                "Constrained (< 100 kW)": COLOR["alert"],
+                "Limited (100–500 kW)": COLOR["stress"],
+                "Comfortable (500–1500 kW)": COLOR["accent"],
+                "Unbounded (regulator absorbs PV)": COLOR["ok"],
+            }
+            fig = go.Figure()
+            for status, sub in df_hc.groupby("Status", sort=False):
+                fig.add_trace(go.Bar(
+                    y=[f"Bus {b}" for b in sub["Bus"]],
+                    x=sub["Headroom (kW)"],
+                    orientation="h",
+                    name=status,
+                    marker_color=color_map.get(status, COLOR["neutral"]),
+                ))
+            layout = _layout("PV HOSTING HEADROOM PER BUS · TOWARD 1.05 PU LIMIT", height=620)
+            layout["margin"] = dict(l=20, r=20, t=44, b=80)
+            layout["yaxis"] = dict(autorange="reversed", tickfont=dict(size=11),
+                                   gridcolor="rgba(0,0,0,0)")
+            layout["barmode"] = "stack"
+            fig.update_layout(**layout)
+            fig.update_xaxes(title_text="kW additional PV before voltage hits 1.05 pu",
+                             title_font=dict(size=11, color=COLOR["text_dim"]))
+            st.plotly_chart(fig, width="stretch")
+            st.caption(
+                "Headroom is computed by injecting test PV (200 kW) at each bus, "
+                "measuring ΔV, and back-extrapolating to the 1.05 pu limit. "
+                "*Unbounded* buses are downstream of a voltage regulator that "
+                "absorbs the PV-induced voltage rise — they are the priority "
+                "interconnection candidates."
+            )
+
+    with tab_ctg:
+        st.markdown(
+            "**N-1 contingency** — re-solve OpenDSS with one element taken out "
+            "and compare violation counts to the in-service base case. This is "
+            "how planners decide whether a feeder needs redundant tie-switches "
+            "or whether a regulator is a single point of failure."
+        )
+        contingency_options = {
+            "Voltage regulator Reg1 (@ Bus 814)": "RegControl.Reg1",
+            "Voltage regulator Reg2 (@ Bus 852)": "RegControl.Reg2",
+            "In-line transformer 832 → 888": "Transformer.XFM_832_888",
+            "Long line 818 → 820 (longest 302-config segment)": "Line.L_818_820",
+            "Substation transformer (Sub)": "Transformer.Sub",
+        }
+        ctg_selected = st.multiselect(
+            "Elements to take out of service",
+            options=list(contingency_options.keys()),
+            default=[],
+            help="Select one or more elements. The OpenDSS deck is re-solved "
+                 "with each element disabled; results are compared to the base case.",
+        )
+        if not ctg_selected:
+            st.info("Pick at least one element above to run a contingency analysis.")
+        else:
+            disabled = tuple(contingency_options[k] for k in ctg_selected)
+            day_kw_flat = day_kw[0].astype(np.float32)  # use first day of week as representative
+            # Base case (no outage)
+            base_dicts = _solve(day_kw_flat.tobytes(), tuple(bus_order), day_kw_flat.shape)
+            ctg_dicts  = _solve_contingency(day_kw_flat.tobytes(), tuple(bus_order),
+                                            day_kw_flat.shape, disabled)
+            base_res = _to_hour_results(base_dicts)
+            ctg_res  = _to_hour_results(ctg_dicts)
+            n_v_base = sum(len(r.voltage_violations) for r in base_res)
+            n_v_ctg  = sum(len(r.voltage_violations) for r in ctg_res)
+            n_t_base = sum(len(r.thermal_overloads) for r in base_res)
+            n_t_ctg  = sum(len(r.thermal_overloads) for r in ctg_res)
+            worst_base = min((v for r in base_res for v in r.bus_voltage_pu.values()),
+                             default=float("nan"))
+            worst_ctg  = min((v for r in ctg_res for v in r.bus_voltage_pu.values()),
+                             default=float("nan"))
+
+            cc1, cc2, cc3 = st.columns(3)
+            cc1.metric("Voltage violations (24 hr)", n_v_ctg, f"{n_v_ctg - n_v_base:+d} vs base",
+                       delta_color="inverse")
+            cc2.metric("Thermal overloads (24 hr)", n_t_ctg, f"{n_t_ctg - n_t_base:+d} vs base",
+                       delta_color="inverse")
+            cc3.metric("Worst voltage (pu)", f"{worst_ctg:.3f}",
+                       f"{worst_ctg - worst_base:+.3f} vs base",
+                       delta_color="normal")
+            verdict_color = (COLOR["ok"] if n_v_ctg == n_v_base else
+                             COLOR["warn"] if n_v_ctg < n_v_base + 5 else COLOR["alert"])
+            verdict_text = (
+                "Feeder rides through this contingency without new violations." if n_v_ctg == n_v_base else
+                f"Contingency adds {n_v_ctg - n_v_base} violation hours — degraded but operable." if n_v_ctg < n_v_base + 10 else
+                f"Severe contingency: {n_v_ctg - n_v_base} new violation hours. "
+                f"Consider tie-switch / redundant regulator investment."
+            )
+            st.markdown(
+                f"<div style='margin-top:12px; padding:10px 14px; border-left:3px solid "
+                f"{verdict_color}; background:{COLOR['bg_card']}; border-radius:3px; "
+                f"font-size:0.92rem; color:{COLOR['text']};'>"
+                f"<b style='color:{verdict_color};'>Planner verdict:</b> {verdict_text}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
     with tab_capex:
         st.caption(
             "Capital projects ranked by annualised violation hours × severity. "
-            "Cost and payback are order-of-magnitude planning estimates — useful for "
-            "deciding *where* to invest, not for procurement."
+            "Costs are planning-grade ranges (lower = bulk-power BOS, upper = "
+            "distribution-scale BOS). SAIDI footprint is calculated from "
+            "downstream-customer count using Phoenix residential averages."
         )
-        with st.expander("How are cost and payback calculated?"):
+        with st.expander("How are cost, payback, and SAIDI calculated?"):
             st.markdown(
                 """
                 **Sizing**
@@ -1305,59 +1707,139 @@ def render_planner_view():
                 - **Volt-VAR program (overvoltage)** kVAr = `50 + 3 × bus_nominal_kw`
                   — reactive support to absorb PV backfeed.
 
-                **Cost (capex, order-of-magnitude 2024 USD)**
-                - Battery: **$1,500 / kW** installed (inverter + civil + commissioning).
-                - Volt-VAR: **$100 / kVAr** of reactive support.
+                **Cost ranges (2025 USD, distribution-scale)**
+                - Battery: **$1,500–$3,500 / kW** installed. Lower bound = bulk-power
+                  battery BOS; upper bound = distribution-scale (50–500 kW) including
+                  civil, interconnection study, permitting overhead.
+                - Volt-VAR program: **$100–$350 / kVAr**. Lower = firmware-only
+                  enrolment of existing IEEE 1547-2018 inverters; upper = full new
+                  cap-bank install with switching control.
 
                 **Annualised violation hours**
                 `hours_year = hours_this_week × 13 weeks × 3 seasons / 3`
                 — projects this week onto a 13-summer-week season, repeated for ~3 stress seasons/yr.
 
-                **Payback (years)** = `cost / annual_avoided_value`
-                - **Battery**: avoided value = `hours_year × 60 min × 20 customers/bus × $0.15/min`
-                  (CAIDI proxy: $0.15 per customer-minute of avoided outage).
-                - **Volt-VAR**: avoided value = `hours_year × 50 kW curtailed × $0.08/kWh`
-                  (recovered PV revenue at wholesale).
-                - **Monitor / watch-list** entries have no investment, so payback is *n/a* by design.
+                **SAIDI footprint** (System Average Interruption Duration Index — what APS reports to ACC)
+                - `customers_affected = max(5, bus_nominal_kw / 4.5 kW per Phoenix residential customer)`
+                - `SAIDI_minutes_per_yr = hours_year × 60 × customers_affected`
+                - This is the planning-grade approximation; a real ICE-Calculator run would refine it.
+
+                **Payback (years)** = `midpoint_cost / annual_avoided_value`
+                - **Battery**: `avoided = SAIDI_min × $0.18 / customer-min` (CAIDI proxy).
+                - **Volt-VAR**: `avoided = hours_year × 50 kW curtailed × $0.08/kWh` (recovered PV revenue at wholesale).
                 - Payback above 100 years is shown as *n/a* — beyond planning horizon.
+
+                **Monitor / watch list** entries are zero-capex tracking items. Each
+                comes with an explicit *escalation trigger* — the metric and
+                threshold that promotes it to a real capital project.
                 """
             )
+
         if not plan_actions:
             st.success("No capital projects warranted this week — feeder is operating within limits.")
         else:
-            df_actions = planner_actions_to_df(plan_actions)
-            df_actions["kind"] = df_actions["kind"].apply(fmt_kind)
-            df_disp = df_actions.rename(columns={
-                "priority": "Pri.",
-                "bus": "Bus",
-                "kind": "Project type",
-                "suggested_kw": "Size (kW)",
-                "est_cost_usd": "Cost (USD)",
-                "violation_hours_per_week": "Hr/wk now",
-                "violation_hours_per_year": "Hr/yr (annualized)",
-                "worst_v_pu": "Worst V",
-                "n_days_with_violation": "Days affected",
-                "rationale": "Rationale",
-                "payback_years": "Payback (yr)",
-            })
-            df_disp["Cost (USD)"] = df_disp["Cost (USD)"].map(
-                lambda x: f"${x:,.0f}" if x and x > 0 else "—")
-            df_disp["Hr/yr (annualized)"] = df_disp["Hr/yr (annualized)"].map(lambda x: f"{x:.0f}")
-            df_disp["Size (kW)"] = df_disp["Size (kW)"].map(
-                lambda x: f"{x:.0f}" if x and x > 0 else "—")
-            df_disp["Worst V"] = df_disp["Worst V"].map(lambda x: f"{x:.3f} pu")
-            df_disp["Payback (yr)"] = df_disp["Payback (yr)"].map(
-                lambda x: f"{x:.1f}" if pd.notna(x) else "n/a")
-            ordered = ["Pri.", "Bus", "Project type", "Size (kW)", "Cost (USD)",
-                       "Hr/wk now", "Hr/yr (annualized)", "Worst V",
-                       "Days affected", "Payback (yr)", "Rationale"]
-            df_capex = df_disp[ordered]
-            df_capex = column_picker(
-                df_capex, key="planner_capex",
-                default_cols=ordered,
-                essential_cols=["Pri.", "Bus", "Project type"],
-            )
-            scrollable_table(df_capex, max_height=460)
+            for a in plan_actions:
+                _render_planner_action_card(a)
+
+
+def _render_planner_action_card(a):
+    """Render one PlannerAction as a planner-grade card (not a row)."""
+    is_monitor = a.kind == "monitor"
+    border_color = COLOR["neutral"] if is_monitor else (
+        COLOR["alert"] if a.kind == "battery_install" else COLOR["accent"]
+    )
+    label_text = "WATCH LIST" if is_monitor else f"PRIORITY {a.priority}"
+    kind_text = fmt_kind(a.kind)
+
+    # Cost line
+    if not is_monitor:
+        cost_line = (f"<b>${a.cost_low_usd/1000:,.0f}k – ${a.cost_high_usd/1000:,.0f}k</b> "
+                     f"<span style='color:{COLOR['text_dim']};'>(planning estimate, distribution-scale)</span>")
+    else:
+        cost_line = "<span style='color:" + COLOR["text_dim"] + ";'>No investment — tracking only</span>"
+
+    # SAIDI / customer line
+    saidi_line = ""
+    if not is_monitor:
+        saidi_part = (f"<b>{a.saidi_minutes_year:,.0f} SAIDI-min/yr</b> avoided "
+                      if a.saidi_minutes_year > 0 else
+                      f"<b>{a.violation_hours_per_year:.0f} curtailment hr/yr</b> avoided ")
+        saidi_line = (f"<div style='color:{COLOR['text_dim']}; font-size:0.86rem; margin-top:6px;'>"
+                      f"{saidi_part}for ~<b style='color:{COLOR['text']};'>"
+                      f"{a.customers_affected}</b> customers · "
+                      f"~${a.avoided_outage_usd_year:,.0f}/yr avoided outage cost</div>")
+    else:
+        saidi_line = (f"<div style='color:{COLOR['text_dim']}; font-size:0.86rem; margin-top:6px;'>"
+                      f"~<b style='color:{COLOR['text']};'>{a.customers_affected}</b> downstream customers</div>")
+
+    # Payback line
+    if a.payback_years is not None and not is_monitor:
+        pb_color = COLOR["ok"] if a.payback_years < 15 else (
+            COLOR["warn"] if a.payback_years < 30 else COLOR["alert"])
+        payback_line = (f"<span style='color:{pb_color}; font-weight:600;'>"
+                        f"~{a.payback_years:.1f} yr payback</span>")
+    elif is_monitor:
+        payback_line = ""
+    else:
+        payback_line = (f"<span style='color:{COLOR['text_dim']};'>payback &gt; 100 yr "
+                        f"(reliability rationale, not financial)</span>")
+
+    # Nearby existing assets
+    nearby_html = ""
+    if a.nearby_existing:
+        items = "".join(
+            f"<li style='margin: 2px 0;'>{e}</li>" for e in a.nearby_existing[:3]
+        )
+        nearby_html = (
+            f"<div style='margin-top:10px; padding:8px 12px; background:#FFFFFF; "
+            f"border:1px solid {COLOR['border']}; border-radius:3px;'>"
+            f"<div style='font-size:0.72rem; color:{COLOR['text_dim']}; "
+            f"text-transform:uppercase; letter-spacing:0.06em; font-weight:600;'>Existing nearby assets · check first</div>"
+            f"<ul style='margin: 4px 0 0 18px; padding:0; font-size:0.86rem; color:{COLOR['text']};'>{items}</ul>"
+            f"</div>"
+        )
+
+    # Escalation trigger (monitor only)
+    escalation_html = ""
+    if a.escalation_trigger:
+        escalation_html = (
+            f"<div style='margin-top:10px; padding:8px 12px; background:#FAF1DD; "
+            f"border-left:3px solid {COLOR['accent']}; border-radius:3px; font-size:0.86rem;'>"
+            f"<b style='color:{COLOR['accent_dim']};'>Escalation trigger:</b> "
+            f"<span style='color:{COLOR['text']};'>{a.escalation_trigger}</span>"
+            f"</div>"
+        )
+
+    size_str = f"{a.suggested_kw:.0f} kW" if a.suggested_kw > 0 else "—"
+
+    st.markdown(
+        f"""
+        <div style="background:{COLOR['bg_card']}; border:1px solid {COLOR['border']};
+                    border-left:4px solid {border_color}; border-radius:4px;
+                    padding:1.0rem 1.2rem; margin: 0.6rem 0;">
+          <div style="display:flex; justify-content:space-between; align-items:baseline; gap:18px; flex-wrap:wrap;">
+            <div>
+              <span style="font-size:11px; letter-spacing:0.08em; text-transform:uppercase;
+                           color:{border_color}; font-weight:700;">{label_text}</span>
+              &nbsp;·&nbsp;
+              <span style="font-size:1.05rem; font-weight:600; color:{COLOR['text']};">{kind_text} at Bus {a.bus}</span>
+              &nbsp;<span style="color:{COLOR['text_dim']};">({size_str})</span>
+            </div>
+            <div style="font-size:0.92rem;">{payback_line}</div>
+          </div>
+          <div style="margin-top:8px; font-size:0.92rem; color:{COLOR['text']};">
+            {a.rationale}
+          </div>
+          <div style="margin-top:10px; font-size:0.92rem; color:{COLOR['text_dim']};">
+            <b style="color:{COLOR['text']};">Cost:</b> {cost_line}
+          </div>
+          {saidi_line}
+          {nearby_html}
+          {escalation_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 # Render

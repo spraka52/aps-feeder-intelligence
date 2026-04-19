@@ -11,35 +11,71 @@ capital-project candidate.
 
 We deliberately keep the cost / payback numbers rough — the point is to
 rank which buses deserve a project, not to produce a bankable business case.
+
+Cost basis (planning-grade, 2025 USD)
+-------------------------------------
+The unit costs below reflect *distribution-scale* (50–500 kW) installations,
+which carry significant balance-of-system overhead per unit relative to
+bulk-power batteries. Real APS interconnection quotes cluster in these
+ranges; we report a low-high band on every action card so the planner sees
+the uncertainty and doesn't anchor to a single number.
+
+Reliability metric basis
+------------------------
+We convert avoided violation-hours into avoided customer-interruption
+minutes (≈ SAIDI minutes) using a downstream-customer-count proxy that
+scales with bus nominal load. APS reports SAIDI to the Arizona Corporation
+Commission annually, so this is the metric that lands in an IRP review.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
+from data.topology import nearby_assets
 from physics.opendss_runner import HourResult
 
 
 VMIN_PU = 0.95
 VMAX_PU = 1.05
 
+# Cost ranges (2025 USD, distribution-scale)
+BATTERY_USD_PER_KW_LOW   = 1500.0     # bulk-power lower-bound
+BATTERY_USD_PER_KW_HIGH  = 3500.0     # distribution-scale realistic
+VOLT_VAR_USD_PER_KVAR_LOW   = 100.0   # firmware-only Volt-VAR enrolment
+VOLT_VAR_USD_PER_KVAR_HIGH  = 350.0   # full new cap-bank install
+# Reliability valuation
+USD_PER_CUSTOMER_MIN     = 0.18       # CAIDI avoided-interruption proxy
+# Customer-count proxy: # customers downstream ≈ bus_kw / per_customer_kw
+KW_PER_CUSTOMER          = 4.5        # Phoenix residential winter average
+
 
 @dataclass
 class PlannerAction:
     priority: int
     bus: str
-    kind: str                   # "battery_install" | "cap_bank_install" | "reconductor" | "ders_curtailment"
+    kind: str                   # "battery_install" | "volt_var_program" | "monitor"
     suggested_kw: float         # rough sizing (kW)
-    est_cost_usd: float         # rough capital cost
-    violation_hours_per_week: float
-    violation_hours_per_year: float
-    worst_v_pu: float
-    n_days_with_violation: int
-    rationale: str
+    est_cost_usd: float         # midpoint capital cost
+    cost_low_usd: float = 0.0   # planning-grade lower bound
+    cost_high_usd: float = 0.0  # planning-grade upper bound
+    violation_hours_per_week: float = 0.0
+    violation_hours_per_year: float = 0.0
+    worst_v_pu: float = 1.0
+    n_days_with_violation: int = 0
+    rationale: str = ""
     payback_years: Optional[float] = None  # rough — uses $0.15/kWh avoided-customer-minute-equivalent
+    # SAIDI / SAIFI footprint
+    customers_affected: int = 0
+    saidi_minutes_year: float = 0.0
+    avoided_outage_usd_year: float = 0.0
+    # Existing asset annotation
+    nearby_existing: List[str] = field(default_factory=list)
+    # Escalation criteria (only filled for monitor entries)
+    escalation_trigger: Optional[str] = None
 
 
 def _aggregate_bus_week(bus: str, per_day_results: List[List[HourResult]]) -> dict:
@@ -126,6 +162,16 @@ def _size_battery_for_sag(worst_v_pu: float, bus_nominal_kw: float) -> float:
     return float(np.clip(kw, 25.0, 2000.0))
 
 
+def _customers_for_bus(nominal_kw: float) -> int:
+    """Rough downstream-customer count for a bus given its nominal kW."""
+    return max(5, int(round(nominal_kw / KW_PER_CUSTOMER)))
+
+
+def _format_existing(bus: str) -> List[str]:
+    return [a["label"] + f" ({a['hops_from_bus']} hop{'s' if a['hops_from_bus'] != 1 else ''} away)"
+            for a in nearby_assets(bus, max_hops=4)]
+
+
 def build_planner_actions(
     weekly_df: pd.DataFrame,
     bus_nominal_kw: dict[str, float],
@@ -157,19 +203,28 @@ def build_planner_actions(
         hours_year = hrs_week * 13 * seasons_per_year / 3.0
         seen_buses.add(bus)
 
+        n_customers = _customers_for_bus(nominal)
+        existing = _format_existing(bus)
+
         if worst < VMIN_PU:
             # Undervoltage: battery install (real-power) is the canonical answer
             size_kw = _size_battery_for_sag(worst, nominal)
-            cost = size_kw * 1500.0
-            avoided_cust_mins = hours_year * 60 * 20  # rough: 20 customers downstream affected
-            avoided_usd = avoided_cust_mins * 0.15
-            payback = cost / max(avoided_usd, 1.0)
+            cost_low  = size_kw * BATTERY_USD_PER_KW_LOW
+            cost_high = size_kw * BATTERY_USD_PER_KW_HIGH
+            cost_mid  = (cost_low + cost_high) / 2.0
+            saidi_minutes = hours_year * 60.0 * n_customers
+            avoided_usd = saidi_minutes * USD_PER_CUSTOMER_MIN
+            payback = cost_mid / max(avoided_usd, 1.0)
+            preface = (f"Existing nearby: {existing[0].split('(')[0].strip()}. "
+                       if existing else "")
             actions.append(PlannerAction(
                 priority=0,
                 bus=bus,
                 kind="battery_install",
                 suggested_kw=size_kw,
-                est_cost_usd=cost,
+                est_cost_usd=cost_mid,
+                cost_low_usd=cost_low,
+                cost_high_usd=cost_high,
                 violation_hours_per_week=hrs_week,
                 violation_hours_per_year=hours_year,
                 worst_v_pu=worst,
@@ -177,37 +232,58 @@ def build_planner_actions(
                 rationale=(
                     f"Undervoltage at Bus {bus} "
                     f"({hrs_week:.0f} hr/week, worst {worst:.3f} pu). "
-                    f"Battery / cap-bank dispatch closes the gap; "
-                    f"battery also enables EV-load deferral and DR enrollment."
+                    f"{preface}"
+                    f"First check: re-set the nearest regulator vreg up by 1.5 V before capex. "
+                    f"If that's already at limit, a battery / cap-bank dispatch closes the gap and "
+                    f"unlocks EV-deferral and DR enrolment options."
                 ),
                 payback_years=payback if payback < 100 else None,
+                customers_affected=n_customers,
+                saidi_minutes_year=saidi_minutes,
+                avoided_outage_usd_year=avoided_usd,
+                nearby_existing=existing,
             ))
         elif worst > VMAX_PU:
             # Overvoltage: PV-backfeed symptom → Volt-VAR + smart inverter coordination
             size_kvar = 50.0 + 3.0 * nominal
-            cost = size_kvar * 100.0  # reactive-support cost
+            cost_low  = size_kvar * VOLT_VAR_USD_PER_KVAR_LOW
+            cost_high = size_kvar * VOLT_VAR_USD_PER_KVAR_HIGH
+            cost_mid  = (cost_low + cost_high) / 2.0
             # Overvoltage payback: avoided PV curtailment. When inverters trip on
             # overvoltage, ~50 kW of generation per cluster is curtailed. Recover
             # that at ~$0.08/kWh wholesale-equivalent.
             avoided_kwh = hours_year * 50.0
             avoided_usd = avoided_kwh * 0.08
-            payback = cost / max(avoided_usd, 1.0)
+            payback = cost_mid / max(avoided_usd, 1.0)
+            # Customer count = upstream affected by inverter trips
+            n_customers_pv = max(3, int(round(nominal / 25.0)))
+            preface = (f"Existing nearby: {existing[0].split('(')[0].strip()}. "
+                       if existing else "")
             actions.append(PlannerAction(
                 priority=0,
                 bus=bus,
                 kind="volt_var_program",
                 suggested_kw=size_kvar,
-                est_cost_usd=cost,
+                est_cost_usd=cost_mid,
+                cost_low_usd=cost_low,
+                cost_high_usd=cost_high,
                 violation_hours_per_week=hrs_week,
                 violation_hours_per_year=hours_year,
                 worst_v_pu=worst,
                 n_days_with_violation=int(row["days_with_violation"]),
                 rationale=(
                     f"Overvoltage at Bus {bus} ({hrs_week:.0f} hr/week, "
-                    f"worst {worst:.3f} pu) — consistent with midday PV backfeed. "
-                    f"Enrol inverters in Volt-VAR curtailment; consider fixed-cap bank switching schedule."
+                    f"worst {worst:.3f} pu) — PV backfeed signature. "
+                    f"{preface}"
+                    f"First check: drop the upstream regulator vreg by 1.5 V. "
+                    f"If band-limit reached, enrol inverters in IEEE 1547-2018 "
+                    f"Volt-VAR mode 1 (Q(V)); fixed-cap switch is a fallback."
                 ),
                 payback_years=payback if payback < 100 else None,
+                customers_affected=n_customers_pv,
+                saidi_minutes_year=0.0,  # overvoltage doesn't drop service
+                avoided_outage_usd_year=avoided_usd,
+                nearby_existing=existing,
             ))
 
     # If the violations list is small, add the largest non-violating buses as
@@ -221,22 +297,34 @@ def build_planner_actions(
         for bus, nominal_kw in watch_pool[: max(0, 5 - len(actions))]:
             if nominal_kw < 10:
                 continue
+            n_customers = _customers_for_bus(nominal_kw)
+            existing = _format_existing(bus)
             actions.append(PlannerAction(
                 priority=0,
                 bus=bus,
                 kind="monitor",
                 suggested_kw=0.0,
                 est_cost_usd=0.0,
+                cost_low_usd=0.0, cost_high_usd=0.0,
                 violation_hours_per_week=0.0,
                 violation_hours_per_year=0.0,
                 worst_v_pu=1.0,
                 n_days_with_violation=0,
                 rationale=(
-                    f"Bus {bus} ({nominal_kw:.0f} kW nominal) is currently inside the voltage band "
-                    f"but is one of the largest loads on the feeder — track on the AMI dashboard "
-                    f"and re-evaluate as EV adoption climbs."
+                    f"Bus {bus} ({nominal_kw:.0f} kW nominal, ~{n_customers} customers) "
+                    f"is inside the voltage band but is one of the largest loads on the feeder. "
+                    f"Re-evaluate when EV penetration rises."
                 ),
                 payback_years=None,
+                customers_affected=n_customers,
+                saidi_minutes_year=0.0,
+                avoided_outage_usd_year=0.0,
+                nearby_existing=existing,
+                escalation_trigger=(
+                    "Promote to capital project if **any** of: "
+                    f"violation hours/week ≥ 5 for 2 consecutive weeks  ·  "
+                    f"worst voltage ≤ 0.945 pu  ·  EV adoption ≥ 25% on feeder."
+                ),
             ))
 
     # Rank: real violations first (by annualised hours × severity), then monitors.
