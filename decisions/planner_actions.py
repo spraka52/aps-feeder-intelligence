@@ -130,23 +130,32 @@ def build_planner_actions(
     weekly_df: pd.DataFrame,
     bus_nominal_kw: dict[str, float],
     seasons_per_year: int = 3,  # we model summer only; extrapolate conservatively
+    min_hours_for_capex: float = 1.0,
+    min_hours_for_monitor: float = 0.0,
 ) -> List[PlannerAction]:
     """Turn the weekly aggregate into capital-project recommendations.
 
     Ranking is by annualized violation hours × severity, so a bus that
     violates 14 h this week (every day) ranks higher than one that violates
     10 h in a single-day spike.
+
+    Buses with at least one violation hour become *capital* candidates;
+    buses with no violation but high nominal load get a *monitor* entry so
+    a planner always sees the broader watch list, not only the worst case.
     """
     actions: List[PlannerAction] = []
+    seen_buses: set[str] = set()
     for _, row in weekly_df.iterrows():
-        if row["violation_hours_week"] < 3:
-            continue  # not enough persistence to warrant a capital project
+        hrs_week = float(row["violation_hours_week"])
+        if hrs_week < min_hours_for_capex:
+            continue
 
         bus = row["bus"]
         worst = float(row["worst_v_pu"])
         nominal = float(bus_nominal_kw.get(bus, 50.0))
         # Annualize: 13 summer weeks × N simulated seasons/year + a shoulder factor
-        hours_year = float(row["violation_hours_week"]) * 13 * seasons_per_year / 3.0
+        hours_year = hrs_week * 13 * seasons_per_year / 3.0
+        seen_buses.add(bus)
 
         if worst < VMIN_PU:
             # Undervoltage: battery install (real-power) is the canonical answer
@@ -161,13 +170,13 @@ def build_planner_actions(
                 kind="battery_install",
                 suggested_kw=size_kw,
                 est_cost_usd=cost,
-                violation_hours_per_week=float(row["violation_hours_week"]),
+                violation_hours_per_week=hrs_week,
                 violation_hours_per_year=hours_year,
                 worst_v_pu=worst,
                 n_days_with_violation=int(row["days_with_violation"]),
                 rationale=(
-                    f"Chronic undervoltage at Bus {bus} "
-                    f"({int(row['violation_hours_week'])} hr/week, worst {worst:.3f} pu). "
+                    f"Undervoltage at Bus {bus} "
+                    f"({hrs_week:.0f} hr/week, worst {worst:.3f} pu). "
                     f"Battery / cap-bank dispatch closes the gap; "
                     f"battery also enables EV-load deferral and DR enrollment."
                 ),
@@ -183,20 +192,51 @@ def build_planner_actions(
                 kind="volt_var_program",
                 suggested_kw=size_kvar,
                 est_cost_usd=cost,
-                violation_hours_per_week=float(row["violation_hours_week"]),
+                violation_hours_per_week=hrs_week,
                 violation_hours_per_year=hours_year,
                 worst_v_pu=worst,
                 n_days_with_violation=int(row["days_with_violation"]),
                 rationale=(
-                    f"Persistent overvoltage at Bus {bus} ({int(row['violation_hours_week'])} hr/week, "
+                    f"Overvoltage at Bus {bus} ({hrs_week:.0f} hr/week, "
                     f"worst {worst:.3f} pu) — consistent with midday PV backfeed. "
                     f"Enrol inverters in Volt-VAR curtailment; consider fixed-cap bank switching schedule."
                 ),
                 payback_years=None,  # overvoltage prevention ROI is harder to dollar-ize
             ))
 
-    # Rank by annualized hours × severity (persistence × magnitude)
+    # If the violations list is small, add the largest non-violating buses as
+    # *monitor* entries so a planner always sees a broader watch-list.
+    if len(actions) < 5:
+        # Highest-load buses we haven't already flagged.
+        watch_pool = sorted(
+            [(b, kw) for b, kw in bus_nominal_kw.items() if b not in seen_buses],
+            key=lambda x: x[1], reverse=True,
+        )
+        for bus, nominal_kw in watch_pool[: max(0, 5 - len(actions))]:
+            if nominal_kw < 10:
+                continue
+            actions.append(PlannerAction(
+                priority=0,
+                bus=bus,
+                kind="monitor",
+                suggested_kw=0.0,
+                est_cost_usd=0.0,
+                violation_hours_per_week=0.0,
+                violation_hours_per_year=0.0,
+                worst_v_pu=1.0,
+                n_days_with_violation=0,
+                rationale=(
+                    f"Bus {bus} ({nominal_kw:.0f} kW nominal) is currently inside the voltage band "
+                    f"but is one of the largest loads on the feeder — track on the AMI dashboard "
+                    f"and re-evaluate as EV adoption climbs."
+                ),
+                payback_years=None,
+            ))
+
+    # Rank: real violations first (by annualised hours × severity), then monitors.
     def _score(a: PlannerAction) -> float:
+        if a.kind == "monitor":
+            return -1.0  # always last
         severity = abs(a.worst_v_pu - 1.0) / 0.05
         return a.violation_hours_per_year * (1.0 + severity)
     actions.sort(key=_score, reverse=True)

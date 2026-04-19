@@ -322,7 +322,18 @@ def reg_tap_chart(res_b, res_s, times) -> go.Figure:
                 line=dict(width=2, color=col, dash=line_dash.get(name, "solid")),
                 marker=dict(size=4), opacity=op,
             ))
-    fig.update_layout(**_layout("REGULATOR TAP POSITIONS · QSTS", height=300))
+    layout = _layout("REGULATOR TAP POSITIONS · QSTS", height=340)
+    # 4 series wrap onto two rows in the legend — push the legend below the
+    # x-axis tick labels so they don't collide.
+    layout["margin"] = dict(l=12, r=12, t=44, b=110)
+    layout["legend"] = dict(orientation="h", yanchor="top", y=-0.50,
+                            xanchor="center", x=0.5,
+                            bgcolor="rgba(0,0,0,0)",
+                            font=dict(size=10), itemsizing="constant",
+                            itemwidth=40)
+    layout["xaxis"] = dict(gridcolor="rgba(255,255,255,0.06)", zeroline=False,
+                           ticks="outside", automargin=True)
+    fig.update_layout(**layout)
     fig.update_yaxes(title_text="tap step (+ boost / − buck)",
                      title_font=dict(size=11, color=COLOR["text_dim"]))
     return fig
@@ -341,13 +352,21 @@ def violation_heatmap(mat_df: pd.DataFrame, dates) -> go.Figure:
         colorscale=[[0, "#1F2630"], [0.01, "#2C3340"], [0.3, "#D4A03A"], [0.6, "#C97244"], [1, "#B83838"]],
         zmin=0, zmax=max(1, int(sub.values.max())),
         hovertemplate="Bus %{y}<br>%{x}<br><b>%{z}</b> violation hours<extra></extra>",
-        colorbar=dict(title="hr", thickness=10, len=0.78, x=1.02,
+        colorbar=dict(title="hr", thickness=10, len=0.78, x=1.04,
                       tickfont=dict(size=10, color=COLOR["text_dim"])),
     ))
-    layout = _layout("BUS × DAY · VOLTAGE-VIOLATION HOURS", height=520)
-    layout["margin"] = dict(l=80, r=80, t=44, b=20)
-    layout["xaxis"] = dict(side="top", tickfont=dict(size=10), gridcolor="rgba(0,0,0,0)")
-    layout["yaxis"] = dict(tickfont=dict(size=10), gridcolor="rgba(0,0,0,0)")
+    layout = _layout("BUS × DAY · VOLTAGE-VIOLATION HOURS", height=540)
+    # Title sits *above* the chart, x-axis dates sit *inside* on top edge.
+    # We need a tall top margin so the dates don't bleed into the title row.
+    layout["margin"] = dict(l=110, r=110, t=110, b=30)
+    layout["title"] = dict(text="BUS × DAY · VOLTAGE-VIOLATION HOURS",
+                           font=dict(size=12, color=COLOR["text_dim"]),
+                           x=0.0, xanchor="left", y=0.985, yanchor="top")
+    layout["xaxis"] = dict(side="top", tickfont=dict(size=10),
+                           gridcolor="rgba(0,0,0,0)", automargin=True,
+                           tickangle=-30)
+    layout["yaxis"] = dict(tickfont=dict(size=10),
+                           gridcolor="rgba(0,0,0,0)", automargin=True)
     layout["legend"] = dict()
     fig.update_layout(**layout)
     return fig
@@ -421,6 +440,7 @@ KIND_LABEL = {
     "volt_var_program": "Volt-VAR program",
     "cap_bank_install": "Capacitor bank installation",
     "reconductor": "Line reconductoring",
+    "monitor": "Monitor / watch list",
 }
 
 
@@ -858,10 +878,25 @@ def render_operator_view():
                 "severity": "Severity", "target_kw": "Sized kW",
                 "detail": "Description", "recommendation": "Recommended action",
             })
+            # Height grows with row count so the scroll area is generous, capped
+            # so the table never pushes the page off-screen.
+            row_h = 38
+            table_h = min(640, max(220, row_h * (len(df_disp) + 1) + 8))
             st.dataframe(
                 df_disp[["Pri.", "Kind", "Bus / line", "Worst hour", "Hrs",
                          "Severity", "Sized kW", "Description", "Recommended action"]],
-                width="stretch", hide_index=True, height=380,
+                width="stretch", hide_index=True, height=table_h,
+                column_config={
+                    "Pri.": st.column_config.NumberColumn(width="small"),
+                    "Kind": st.column_config.TextColumn(width="small"),
+                    "Bus / line": st.column_config.TextColumn(width="small"),
+                    "Worst hour": st.column_config.TextColumn(width="small"),
+                    "Hrs": st.column_config.NumberColumn(width="small"),
+                    "Severity": st.column_config.NumberColumn(format="%.2f", width="small"),
+                    "Sized kW": st.column_config.NumberColumn(format="%.0f", width="small"),
+                    "Description": st.column_config.TextColumn(width="medium"),
+                    "Recommended action": st.column_config.TextColumn(width="large"),
+                },
             )
 
         with sub_stress:
@@ -875,11 +910,30 @@ def render_operator_view():
 # =============================================================================
 
 def _build_summer_weeks(times: pd.DatetimeIndex) -> List[Tuple[pd.Timestamp, pd.Timestamp]]:
-    weeks = []
-    start = times.min().normalize()
-    while start + pd.Timedelta(days=7) <= times.max():
-        weeks.append((start, start + pd.Timedelta(days=7) - pd.Timedelta(seconds=1)))
-        start = start + pd.Timedelta(days=7)
+    """Return only weeks where the dataset has at least 6 days × 24 hours of data.
+
+    The dataset only covers Jun-Aug for each year — naively iterating week-by-week
+    from min to max would generate Sep-May weeks that have zero hours and crash
+    the downstream solver.
+    """
+    if len(times) == 0:
+        return []
+    times_sorted = pd.DatetimeIndex(sorted(set(times)))
+    weeks: List[Tuple[pd.Timestamp, pd.Timestamp]] = []
+    # Walk year by year, only emit weeks that lie inside the per-year coverage.
+    for year in sorted({t.year for t in times_sorted}):
+        year_times = times_sorted[times_sorted.year == year]
+        if len(year_times) == 0:
+            continue
+        start = year_times.min().normalize()
+        end = year_times.max()
+        while start + pd.Timedelta(days=7) <= end + pd.Timedelta(hours=1):
+            ws = start
+            we = ws + pd.Timedelta(days=7) - pd.Timedelta(seconds=1)
+            n_hours = int(((times_sorted >= ws) & (times_sorted <= we)).sum())
+            if n_hours >= 24 * 6:
+                weeks.append((ws, we))
+            start = start + pd.Timedelta(days=7)
     return weeks
 
 
