@@ -145,6 +145,58 @@ the full history; the dashboard renders it under "Model performance".
 
 ---
 
+## Model artifacts & reproducibility
+
+All trained model artifacts are **committed to the repository** — no
+separate download, no Google Drive link, no cloud bucket required. Cloning
+the repo is enough to run inference end-to-end.
+
+| Artifact | Path | Size | Direct GitHub URL |
+| --- | --- | --- | --- |
+| **Model weights** (PyTorch `.pt`) | `models/checkpoints/graphsage_gru.pt` | 114 KB | [download](https://github.com/spraka52/aps-feeder-intelligence/raw/main/models/checkpoints/graphsage_gru.pt) |
+| **Training report** (JSON) | `models/checkpoints/training_report.json` | 7 KB | [view](https://github.com/spraka52/aps-feeder-intelligence/blob/main/models/checkpoints/training_report.json) |
+| **Training datasets** (4 × `.npz`) | `data/synthetic/*.npz` | ~2.5 MB total | [view directory](https://github.com/spraka52/aps-feeder-intelligence/tree/main/data/synthetic) |
+
+**SHA-256 of `graphsage_gru.pt`:**
+`2a853d8675b0c07a1a63fc179e7fc17546aa78fd2c93525da751746617b6e409`
+
+### What's inside the checkpoint
+
+```python
+ckpt = torch.load("models/checkpoints/graphsage_gru.pt", weights_only=False)
+ckpt.keys()        # ['state_dict', 'model_config', 'scaler', 'bus_order']
+ckpt['model_config']
+# {'n_nodes': 34, 'in_features': 7,
+#  'sage_hidden': 32, 'sage_layers': 2,
+#  'gru_hidden': 64,
+#  'horizon_in': 24, 'horizon_out': 24,
+#  'dropout': 0.1}
+```
+
+- **`state_dict`** — the 27,096 trained weights
+- **`model_config`** — architecture hyperparameters needed to reconstruct the model
+- **`scaler`** — mean/std normalisation stats (`load_mean`, `load_std`, `temp_mean`, `temp_std`, `ghi_max`, `bus_baseline_max`) so inference uses the same scaling as training
+- **`bus_order`** — list of 34 bus IDs in the order the model expects them; used to align input features and output predictions to the correct buses
+
+### Reproducing the trained model
+
+```bash
+# 1. Generate the four scenario datasets (uses cached NOAA / NSRDB / ResStock
+#    parquets shipped under data/*_cache/, so no API key is required).
+python -m data.synthesize --multi --customers resstock
+
+# 2. Train on the concatenation of all four scenarios (~12 min on CPU).
+python -m models.train --epochs 12
+
+# 3. Verify metrics match what we report in the dashboard.
+cat models/checkpoints/training_report.json | python -m json.tool | head -30
+```
+
+Re-training is deterministic given a fixed seed (`seed=7` in `models/train.py`).
+Held-out validation should land within ±0.2 kW RMSE of our reported 7.8 kW.
+
+---
+
 ## Why this model architecture? (and why not alternatives)
 
 We chose **GraphSAGE → GRU → Linear** because the forecasting target is
