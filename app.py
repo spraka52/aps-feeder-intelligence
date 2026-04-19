@@ -32,6 +32,33 @@ REPO = Path(__file__).resolve().parent
 CKPT_PATH = REPO / "models" / "checkpoints" / "graphsage_gru.pt"
 BASELINE_NPZ = REPO / "data" / "synthetic" / "baseline.npz"
 STRESS_NPZ = REPO / "data" / "synthetic" / "stress_ev35_pv8.npz"
+MILD_NPZ = REPO / "data" / "synthetic" / "mild_stress_ev20_pv4.npz"
+SEVERE_NPZ = REPO / "data" / "synthetic" / "severe_stress_ev50_pv12.npz"
+
+# Named scenario registry — used by both Operator and Planner views so the
+# label, dataset path, and "what's in it" stay in one place.
+SCENARIO_REGISTRY = {
+    "Baseline · no DER, no EV": {
+        "path": BASELINE_NPZ,
+        "ev_pct": 0,  "pv_kw": 0,
+        "tag": "baseline",
+    },
+    "Mild stress · +20% EV, +4 kW PV/bus": {
+        "path": MILD_NPZ,
+        "ev_pct": 20, "pv_kw": 4,
+        "tag": "mild",
+    },
+    "Stress · +35% EV, +8 kW PV/bus": {
+        "path": STRESS_NPZ,
+        "ev_pct": 35, "pv_kw": 8,
+        "tag": "stress",
+    },
+    "Severe stress · +50% EV, +12 kW PV/bus": {
+        "path": SEVERE_NPZ,
+        "ev_pct": 50, "pv_kw": 12,
+        "tag": "severe",
+    },
+}
 
 
 # -----------------------------------------------------------------------------
@@ -1097,18 +1124,35 @@ with hdr_src:
         unsafe_allow_html=True,
     )
 
-if not CKPT_PATH.exists() or not BASELINE_NPZ.exists():
-    st.error("Missing artifacts. Run `python -m data.synthesize --multi --customers resstock` then `python -m models.train --epochs 25`.")
+missing = [name for name, info in SCENARIO_REGISTRY.items() if not info["path"].exists()]
+if not CKPT_PATH.exists() or missing:
+    st.error(
+        f"Missing artifacts: {', '.join(missing) if missing else 'model checkpoint'}. "
+        f"Run `python -m data.synthesize --multi --customers resstock` then "
+        f"`python -m models.train --epochs 25`."
+    )
     st.stop()
 
 # Load
 ckpt_sig = _file_signature(CKPT_PATH)
 base_sig = _file_signature(BASELINE_NPZ)
 stress_sig = _file_signature(STRESS_NPZ)
+mild_sig = _file_signature(MILD_NPZ)
+severe_sig = _file_signature(SEVERE_NPZ)
 
 forecaster = _get_forecaster(ckpt_sig[0])
 ds_base = _get_dataset(str(BASELINE_NPZ), *base_sig)
 ds_stress = _get_dataset(str(STRESS_NPZ), *stress_sig)
+ds_mild = _get_dataset(str(MILD_NPZ), *mild_sig)
+ds_severe = _get_dataset(str(SEVERE_NPZ), *severe_sig)
+
+# Tag-keyed dataset lookup for the planner radio
+SCENARIO_DATASETS = {
+    "baseline": ds_base,
+    "mild":     ds_mild,
+    "stress":   ds_stress,
+    "severe":   ds_severe,
+}
 
 # The .npz datasets store timestamps as naive datetime64 in UTC (NOAA ISD-Lite
 # is published in UTC). For display we want America/Phoenix (UTC-7, no DST) so
@@ -1123,6 +1167,8 @@ def _to_phoenix(idx: pd.DatetimeIndex) -> pd.DatetimeIndex:
 
 ds_base.times = _to_phoenix(ds_base.times)
 ds_stress.times = _to_phoenix(ds_stress.times)
+ds_mild.times = _to_phoenix(ds_mild.times)
+ds_severe.times = _to_phoenix(ds_severe.times)
 
 times = ds_base.times
 all_days = sorted({t.date() for t in times})
@@ -1232,25 +1278,24 @@ def render_operator_view():
     fcst_times = times[t0 + forecaster.horizon_in : t0 + forecaster.horizon_in + forecaster.horizon_out]
     hw_in_window = int(ds_base.heatwave[t0 + forecaster.horizon_in : t0 + forecaster.horizon_in + forecaster.horizon_out].sum())
 
-    # ---- EV adoption slider (interpolates between baseline and stress) ---- #
-    ev_options = [0, 10, 20, 35, 50, 60]
-    ev_pct = st.select_slider(
-        "EV evening-peak overlay (% of bus nominal)",
-        options=ev_options, value=35,
-        help="Adds an EV charging overlay equal to this percentage of each "
-             "bus's nominal kW at evening peak. **Not the percentage of "
-             "customers with EVs** — for residential context, ~10% overlay "
-             "roughly maps to ~35% household EV ownership. 0% = no EV; "
-             "35% = the stress preset; >35% extrapolates beyond training data.",
+    # ---- 4-scenario radio (replaces the EV interpolation slider) ---- #
+    scenario_labels_op = list(SCENARIO_REGISTRY.keys())
+    scenario_for_operator = st.radio(
+        "Stress scenario  ·  baseline plus three documented stress levels",
+        scenario_labels_op,
+        index=2,  # default to "Stress · +35% EV, +8 kW PV/bus"
+        horizontal=True,
+        help="Each option is a separately-generated dataset built from the same "
+             "real NOAA + NSRDB + ResStock + ComStock pipeline. The model is "
+             "evaluated against whichever you pick.",
     )
-    ev_label = ("No EV overlay" if ev_pct == 0 else
-                "Stress preset (35% overlay)" if ev_pct == 35 else
-                f"Custom · {ev_pct}% nominal-kW overlay")
+    scenario_info_op = SCENARIO_REGISTRY[scenario_for_operator]
+    ds_op_stress = SCENARIO_DATASETS[scenario_info_op["tag"]]
 
     st.markdown(
         f"<div class='scenario-banner'>"
         f"<b>{scenario_label}</b> &nbsp;·&nbsp; "
-        f"<b>{ev_label}</b> &nbsp;·&nbsp; "
+        f"<b>{scenario_for_operator}</b> &nbsp;·&nbsp; "
         f"horizon: {fcst_times[0].strftime('%a %b %d, %H:%M')} → "
         f"{fcst_times[-1].strftime('%a %b %d, %H:%M')} &nbsp;·&nbsp; "
         f"<b>{hw_in_window}/24</b> heatwave hours in window"
@@ -1259,13 +1304,9 @@ def render_operator_view():
     )
 
     # Run forecasts + OpenDSS
-    fcst_base_raw = forecaster.forecast_window(ds_base, t0)
-    fcst_stress_raw = forecaster.forecast_window(ds_stress, t0)
+    fcst_base = forecaster.forecast_window(ds_base, t0)
+    fcst_stress = forecaster.forecast_window(ds_op_stress, t0)
     bus_order = tuple(forecaster.bus_order)
-
-    # Interpolate the forecast to the user's chosen EV %
-    fcst_base = fcst_base_raw  # keep base unchanged for comparison
-    fcst_stress = interpolate_loads(fcst_base_raw, fcst_stress_raw, ev_pct)
 
     res_base_d = _solve(fcst_base.astype(np.float32).tobytes(), bus_order, fcst_base.shape)
     res_stress_d = _solve(fcst_stress.astype(np.float32).tobytes(), bus_order, fcst_stress.shape)
@@ -1561,10 +1602,8 @@ def render_operator_view():
             )
             try:
                 _mean, p10_s, p90_s = forecaster.forecast_window_with_uncertainty(
-                    ds_stress, t0, n_samples=20,
+                    ds_op_stress, t0, n_samples=20,
                 )
-                p10_s = interpolate_loads(fcst_base_raw, p10_s, ev_pct)
-                p90_s = interpolate_loads(fcst_base_raw, p90_s, ev_pct)
                 st.plotly_chart(
                     horizon_chart(fcst_base, fcst_stress, fcst_times, p10_s, p90_s),
                     width="stretch",
@@ -1715,7 +1754,7 @@ def render_planner_view():
     default_to = available_dates[min(len(available_dates) - 1,
                                      available_dates.index(default_from) + 6)]
 
-    cw1, cw2, cw3 = st.columns([1.5, 1.5, 2.5])
+    cw1, cw2 = st.columns([1, 1])
     with cw1:
         from_date = st.date_input(
             "From date", value=default_from,
@@ -1729,16 +1768,19 @@ def render_planner_view():
             help="Latest day in the analysis window. Pick longer ranges for capital "
                  "planning, shorter for week-by-week comparisons.",
         )
-    with cw3:
-        scenario_for_planner = st.radio(
-            "Scenario",
-            ["Baseline", "Stress · +35% EV overlay, +8 kW PV/bus"],
-            index=1, horizontal=True,
-            help="**Baseline**: real Phoenix load (NOAA + NSRDB + ResStock + ComStock) "
-                 "with no EV overlay and no behind-meter PV.  \n"
-                 "**Stress**: same baseline + 35% nominal-kW EV evening overlay "
-                 "+ 8 kW per bus of behind-meter PV nameplate.",
-        )
+
+    scenario_labels = list(SCENARIO_REGISTRY.keys())
+    scenario_for_planner = st.radio(
+        "Scenario  ·  pick one of four documented stress levels",
+        scenario_labels,
+        index=2,  # default to "Stress · +35% EV, +8 kW PV/bus"
+        horizontal=True,
+        help="Each scenario is a separately-generated dataset built from the same "
+             "real NOAA + NSRDB + ResStock + ComStock pipeline. **Baseline** has "
+             "no DER. **Mild / Stress / Severe** layer increasing EV evening-peak "
+             "overlay and behind-meter PV nameplate. All four are documented "
+             "scenarios — no extrapolation.",
+    )
 
     if from_date > to_date:
         st.error("'From date' must be on or before 'to date'.")
@@ -1759,32 +1801,18 @@ def render_planner_view():
     ws = pd.Timestamp(from_date, tz=tz)
     we = pd.Timestamp(to_date,   tz=tz) + pd.Timedelta(hours=23, minutes=59, seconds=59)
 
-    is_stress = "stress" in scenario_for_planner.lower()
+    scenario_info = SCENARIO_REGISTRY[scenario_for_planner]
+    ds_for = SCENARIO_DATASETS[scenario_info["tag"]]
 
-    # EV slider — interpolates between baseline (0% EV) and stress (35% EV)
-    ev_options = [0, 10, 20, 35, 50, 60]
-    default_ev = 35 if is_stress else 0
-    planner_ev_pct = st.select_slider(
-        "EV evening-peak overlay (% of bus nominal)",
-        options=ev_options, value=default_ev,
-        help="Adds an EV charging overlay equal to this percentage of each "
-             "bus's nominal kW at evening peak. **Not the percentage of "
-             "customers with EVs.** Set above 35% to extrapolate beyond "
-             "the stress preset.",
-    )
-
-    week_mask_base = (ds_base.times >= ws) & (ds_base.times <= we)
+    week_mask_base = (ds_for.times >= ws) & (ds_for.times <= we)
     if week_mask_base.sum() < 24:
         st.error(
             f"Range {from_date} to {to_date} contains fewer than 24 hours of data — "
             f"the dataset only covers {min_date} to {max_date} (Phoenix summers)."
         )
         return
-    week_times = ds_base.times[week_mask_base]
-    week_loads_base = ds_base.loads[:, week_mask_base]
-    week_loads_stress = ds_stress.loads[:, week_mask_base]
-    week_loads = interpolate_loads(week_loads_base, week_loads_stress, planner_ev_pct)
-    ds_for = ds_base  # times / heatwave bookkeeping comes from base
+    week_times = ds_for.times[week_mask_base]
+    week_loads = ds_for.loads[:, week_mask_base]
 
     n_days = len(week_times) // 24
     if n_days < 1:
@@ -1793,7 +1821,7 @@ def render_planner_view():
     day_kw = week_loads[:, : n_days * 24].T.reshape(n_days, 24, -1).astype(np.float32)
     bus_order = tuple(ds_for.bus_order)
 
-    range_label_key = f"{from_date.isoformat()}_{to_date.isoformat()}_ev{planner_ev_pct}"
+    range_label_key = f"{from_date.isoformat()}_{to_date.isoformat()}_{scenario_info['tag']}"
     per_day_dicts = _solve_week_truth(
         day_kw.astype(np.float32).tobytes(),
         bus_order, day_kw.shape, range_label_key,

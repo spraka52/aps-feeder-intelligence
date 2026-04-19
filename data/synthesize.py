@@ -384,6 +384,15 @@ def main():
                    choices=["resstock", "smart_ds", "synthetic"])
     args = p.parse_args()
 
+    # Four documented scenarios — none extrapolated, all generated from the same
+    # underlying NOAA/NSRDB/ResStock+ComStock pipeline so they're comparable.
+    SCENARIOS = [
+        ("baseline",            0.0,  0.0),
+        ("mild_stress_ev20_pv4",   20.0,  4.0),
+        ("stress_ev35_pv8",        35.0,  8.0),
+        ("severe_stress_ev50_pv12", 50.0, 12.0),
+    ]
+
     if args.multi:
         # Three summers: 2024 + 2025 (real NOAA + NSRDB) + 2026 (synthetic
         # projection — real data not yet available for the future summer).
@@ -392,33 +401,40 @@ def main():
             ("2025-06-01", 92, "noaa"),
             ("2026-06-01", 92, "synthetic"),
         ]
-        base = synth_multi_window(windows, {"ev_growth_pct": 0.0, "bm_pv_kw_per_bus": 0.0,
-                                            "customer_source": args.customers})
-        stress = synth_multi_window(windows, {"ev_growth_pct": 35.0, "bm_pv_kw_per_bus": 8.0,
-                                              "customer_source": args.customers})
+        outputs = []
+        for tag, ev, pv in SCENARIOS:
+            print(f"\n=== Generating {tag} (ev_growth_pct={ev}, bm_pv_kw_per_bus={pv}) ===")
+            data = synth_multi_window(windows, {
+                "ev_growth_pct": ev, "bm_pv_kw_per_bus": pv,
+                "customer_source": args.customers,
+            })
+            outputs.append((tag, data))
         label = "multi"
     else:
-        base_cfg = SimConfig(start=args.start, days=args.days,
-                             ev_growth_pct=0.0, bm_pv_kw_per_bus=0.0,
-                             weather_source=args.source,
-                             customer_source=args.customers)
-        base = synth_loads(base_cfg)
-        stress_cfg = SimConfig(start=args.start, days=args.days,
-                               ev_growth_pct=35.0, bm_pv_kw_per_bus=8.0,
-                               weather_source=args.source,
-                               customer_source=args.customers)
-        stress = synth_loads(stress_cfg)
+        outputs = []
+        for tag, ev, pv in SCENARIOS:
+            print(f"\n=== Generating {tag} (ev_growth_pct={ev}, bm_pv_kw_per_bus={pv}) ===")
+            cfg = SimConfig(start=args.start, days=args.days,
+                            ev_growth_pct=ev, bm_pv_kw_per_bus=pv,
+                            weather_source=args.source,
+                            customer_source=args.customers)
+            outputs.append((tag, synth_loads(cfg)))
         label = "single"
 
-    f1 = save_dataset(args.out, base, "baseline")
-    f2 = save_dataset(args.out, stress, "stress_ev35_pv8")
+    written = []
+    for tag, data in outputs:
+        f = save_dataset(args.out, data, tag)
+        written.append(f)
 
-    hw_hours = int(base["in_heatwave"].sum())
-    print(f"\nWrote: {f1}\nWrote: {f2}")
+    base_data = outputs[0][1]
+    hw_hours = int(base_data["in_heatwave"].sum())
+    print("\nWrote:")
+    for f in written:
+        print(f"  {f}")
     print(f"mode={label}  customers={args.customers}")
-    print(f"baseline window: {base['time'][0]} .. {base['time'][-1]}  hours={len(base['time'])}")
-    print(f"baseline temp °C: min={base['temp_c'].min():.1f} max={base['temp_c'].max():.1f} mean={base['temp_c'].mean():.1f}")
-    print(f"baseline kW: mean={base['loads_kw'].mean():.2f}  max={base['loads_kw'].max():.2f}  "
+    print(f"baseline window: {base_data['time'][0]} .. {base_data['time'][-1]}  hours={len(base_data['time'])}")
+    print(f"baseline temp °C: min={base_data['temp_c'].min():.1f} max={base_data['temp_c'].max():.1f} mean={base_data['temp_c'].mean():.1f}")
+    print(f"baseline kW: mean={base_data['loads_kw'].mean():.2f}  max={base_data['loads_kw'].max():.2f}  "
           f"heatwave hours={hw_hours}")
 
 
