@@ -35,23 +35,25 @@ STRESS_NPZ = REPO / "data" / "synthetic" / "stress_ev35_pv8.npz"
 
 
 # -----------------------------------------------------------------------------
-# Restrained, utility-control-center palette.
-# Inspired by SCADA / EMS dashboards: sober colors, narrow accent palette,
-# data takes precedence over chrome.
+# Light, utility-control-center palette.
+# Inspired by SCADA / EMS dashboards: clean white background, slate text,
+# narrow accent palette, data takes precedence over chrome.
 # -----------------------------------------------------------------------------
 COLOR = {
-    "accent":     "#E8A317",   # APS-style restrained gold
-    "accent_dim": "#735114",
-    "baseline":   "#5C8DBF",   # muted blue
-    "stress":     "#C97244",   # muted orange
-    "ok":         "#3FA66E",   # green
-    "warn":       "#D4A03A",   # amber
-    "alert":      "#B83838",   # restrained red
-    "neutral":    "#88909E",
-    "text":       "#E5E8EC",
-    "text_dim":   "#9AA1AC",
-    "bg_card":    "rgba(70, 80, 100, 0.10)",
-    "border":     "rgba(180, 190, 200, 0.18)",
+    "accent":     "#C77F00",   # APS gold (deeper for light-bg contrast)
+    "accent_dim": "#A26800",
+    "baseline":   "#2F66A3",   # deeper blue for light bg
+    "stress":     "#B85525",   # deeper orange
+    "ok":         "#1F8252",   # deeper green
+    "warn":       "#B27A1A",   # amber
+    "alert":      "#9C2828",   # deeper red
+    "neutral":    "#5A6270",
+    "text":       "#1A1F2B",   # near-black
+    "text_dim":   "#5A6270",   # medium slate
+    "bg_card":    "#F4F6F8",   # very light slate
+    "bg_panel":   "#FFFFFF",
+    "border":     "rgba(20, 30, 50, 0.10)",
+    "grid":       "rgba(20, 30, 50, 0.07)",
 }
 
 
@@ -187,26 +189,29 @@ def feeder_map_deck(
         pdk.Layer("ScatterplotLayer", data=nodes,
                   get_position=["lon", "lat"], get_radius="radius",
                   get_fill_color="color", stroked=True,
-                  get_line_color=[20, 25, 30, 240], line_width_min_pixels=1,
+                  get_line_color=[40, 50, 65, 240], line_width_min_pixels=1,
                   pickable=True),
         pdk.Layer("TextLayer", data=labels,
                   get_position=["lon", "lat"],
                   get_text="text", get_size=12,
-                  get_color=[235, 235, 240, 255],
+                  get_color=[26, 31, 43, 255],
                   get_alignment_baseline="'bottom'",
                   get_text_anchor="'middle'",
                   background=True,
                   background_padding=[4, 2],
-                  get_background_color=[15, 22, 30, 220]),
+                  get_background_color=[255, 255, 255, 230]),
     ]
 
     return pdk.Deck(
         layers=layers,
         initial_view_state=view,
-        map_style="dark",
+        map_style="light",
         tooltip={
             "html": "<b>Bus {bus}</b><br/>Voltage: <b>{v_label}</b><br/>Nominal load: {nominal_kw:.0f} kW",
-            "style": {"backgroundColor": "rgb(30,32,38)", "color": "white", "fontSize": "12px"},
+            "style": {"backgroundColor": "#FFFFFF", "color": "#1A1F2B",
+                      "fontSize": "12px", "border": "1px solid #D8DCE2",
+                      "borderRadius": "3px", "padding": "6px 10px",
+                      "boxShadow": "0 2px 8px rgba(0,0,0,0.10)"},
         },
     )
 
@@ -230,7 +235,7 @@ def voltage_legend_chip():
             <span style="width:11px;height:11px;border-radius:50%;background:{COLOR['accent']};opacity:0.85;display:inline-block;"></span>
             Action target</span>
           <span style="display:flex;align-items:center;gap:6px;">
-            <span style="width:18px;height:3px;background:#B83838;display:inline-block;"></span>
+            <span style="width:18px;height:3px;background:{COLOR['alert']};display:inline-block;"></span>
             Transformer</span>
         </div>
         """,
@@ -270,7 +275,7 @@ def scrollable_table(df: pd.DataFrame, max_height: int = 460):
         <style>
           html, body {{
             margin: 0; padding: 0;
-            background: transparent;
+            background: #FFFFFF;
             color: {COLOR['text']};
             font-family: -apple-system, system-ui, "Inter", Helvetica, Arial, sans-serif;
           }}
@@ -279,11 +284,11 @@ def scrollable_table(df: pd.DataFrame, max_height: int = 460):
             max-height: {max_height}px;
             border: 1px solid {COLOR['border']};
             border-radius: 4px;
-            background: rgba(20, 24, 32, 0.55);
+            background: #FFFFFF;
           }}
           .aps-scroll::-webkit-scrollbar {{ height: 10px; width: 10px; }}
           .aps-scroll::-webkit-scrollbar-thumb {{
-            background: rgba(180,190,200,0.25); border-radius: 5px;
+            background: rgba(20, 30, 50, 0.20); border-radius: 5px;
           }}
           .aps-scroll::-webkit-scrollbar-track {{ background: transparent; }}
           .aps-table {{
@@ -295,22 +300,23 @@ def scrollable_table(df: pd.DataFrame, max_height: int = 460):
           }}
           .aps-table th, .aps-table td {{
             padding: 9px 14px;
-            border-bottom: 1px solid rgba(180,190,200,0.10);
+            border-bottom: 1px solid rgba(20, 30, 50, 0.08);
             text-align: left;
             white-space: nowrap;
             vertical-align: top;
           }}
           .aps-thead th {{
-            background: rgba(70,80,100,0.45);
+            background: #F4F6F8;
             color: {COLOR['text_dim']};
-            font-weight: 500;
+            font-weight: 600;
             letter-spacing: 0.06em;
             text-transform: uppercase;
             font-size: 11px;
             position: sticky; top: 0; z-index: 2;
+            border-bottom: 1px solid {COLOR['border']};
           }}
-          .aps-table tbody tr:hover td {{ background: rgba(255,255,255,0.04); }}
-          .aps-table tbody tr:nth-child(even) td {{ background: rgba(255,255,255,0.015); }}
+          .aps-table tbody tr:hover td {{ background: #FAFBFC; }}
+          .aps-table tbody tr:nth-child(even) td {{ background: #FCFCFD; }}
         </style>
       </head>
       <body>
@@ -326,36 +332,65 @@ def column_picker(
     key: str,
     default_cols: Optional[List[str]] = None,
     essential_cols: Optional[List[str]] = None,
-    label: str = "Configure columns",
 ) -> pd.DataFrame:
-    """Popover with a multiselect that lets the user choose visible columns.
+    """Filter-icon popover with a stacked list of checkboxes — one per column.
 
-    `essential_cols` are always present even if the user un-checks them, so
-    the table never collapses to something unusable. Hidden state is keyed
-    by `key` so different tables don't share selections.
+    - Trigger button is a single Material `filter_list` icon, no text noise.
+    - Each optional column is its own checkbox on its own row.
+    - `essential_cols` are always present (and shown above the checkboxes as
+      a static line) even if the user un-ticks everything.
+    - A "Reset" button restores the default selection.
     """
     all_cols = list(df.columns)
     if default_cols is None:
         default_cols = all_cols
     defaults = [c for c in default_cols if c in all_cols]
     essential = [c for c in (essential_cols or []) if c in all_cols]
+    optional = [c for c in all_cols if c not in essential]
 
-    state_key = f"colpick_{key}"
-    chosen = st.session_state.get(state_key, defaults)
+    # Lazy-init each per-checkbox state from defaults the first time we render.
+    for col in optional:
+        ck = f"colchk_{key}__{col}"
+        if ck not in st.session_state:
+            st.session_state[ck] = col in defaults
 
-    with st.popover(f"{label}  ·  {len(chosen)} / {len(all_cols)} shown"):
-        st.caption("Tick the columns you want visible. Essentials are kept "
-                   "regardless to keep the table readable.")
-        chosen = st.multiselect(
-            "Visible columns",
-            options=all_cols,
-            default=chosen,
-            key=state_key,
-            label_visibility="collapsed",
-        )
+    chosen_now = [c for c in optional if st.session_state.get(f"colchk_{key}__{c}", False)]
+    visible_count = len(chosen_now) + len(essential)
+
+    # Material symbol — the trigger label.
+    trigger_label = f":material/filter_list: Columns · {visible_count}/{len(all_cols)}"
+
+    with st.popover(trigger_label, use_container_width=False):
+        rcol1, rcol2 = st.columns([3, 2])
+        with rcol1:
+            st.markdown(
+                f"<div style='font-size:0.78rem;color:{COLOR['text_dim']};"
+                f"text-transform:uppercase;letter-spacing:0.06em;font-weight:600;"
+                f"margin-bottom:6px;'>Show columns</div>",
+                unsafe_allow_html=True,
+            )
+        with rcol2:
+            if st.button("Reset", key=f"colrst_{key}",
+                         use_container_width=True, type="secondary"):
+                for col in optional:
+                    st.session_state[f"colchk_{key}__{col}"] = col in defaults
+                st.rerun()
+
         if essential:
-            st.caption(f"Always shown: {', '.join(essential)}")
+            st.markdown(
+                f"<div style='font-size:0.74rem;color:{COLOR['text_dim']};"
+                f"margin: 2px 0 10px; padding: 4px 8px; "
+                f"background:#F4F6F8; border-radius:3px;'>"
+                f"<b>Always shown:</b> {', '.join(essential)}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
 
+        # One checkbox per optional column, stacked vertically.
+        for col in optional:
+            st.checkbox(col, key=f"colchk_{key}__{col}")
+
+    chosen = [c for c in optional if st.session_state.get(f"colchk_{key}__{c}", False)]
     final = [c for c in all_cols if c in chosen or c in essential]
     if not final:
         final = defaults
@@ -366,12 +401,14 @@ def column_picker(
 
 PLOTLY_LAYOUT_BASE = dict(
     paper_bgcolor="rgba(0,0,0,0)",
-    plot_bgcolor="rgba(255,255,255,0.03)",
+    plot_bgcolor="rgba(244, 246, 248, 0.55)",
     font=dict(family="-apple-system, system-ui, Helvetica, Arial, sans-serif",
               size=12, color=COLOR["text"]),
     margin=dict(l=12, r=12, t=44, b=44),
-    xaxis=dict(gridcolor="rgba(255,255,255,0.06)", zeroline=False, ticks="outside"),
-    yaxis=dict(gridcolor="rgba(255,255,255,0.06)", zeroline=False, ticks="outside"),
+    xaxis=dict(gridcolor=COLOR["grid"], zeroline=False, ticks="outside",
+               linecolor=COLOR["border"], tickcolor=COLOR["border"]),
+    yaxis=dict(gridcolor=COLOR["grid"], zeroline=False, ticks="outside",
+               linecolor=COLOR["border"], tickcolor=COLOR["border"]),
     legend=dict(orientation="h", yanchor="bottom", y=-0.32, xanchor="center", x=0.5,
                 bgcolor="rgba(0,0,0,0)", font=dict(size=11), itemsizing="constant"),
 )
@@ -465,7 +502,7 @@ def violation_heatmap(mat_df: pd.DataFrame, dates) -> go.Figure:
         z=sub.values,
         x=x_labels,
         y=[f"Bus {b}" for b in sub.index],
-        colorscale=[[0, "#1F2630"], [0.01, "#2C3340"], [0.3, "#D4A03A"], [0.6, "#C97244"], [1, "#B83838"]],
+        colorscale=[[0, "#F4F6F8"], [0.01, "#EAE3D2"], [0.3, "#E2B062"], [0.6, "#C97244"], [1, "#9C2828"]],
         zmin=0, zmax=max(1, int(sub.values.max())),
         hovertemplate="Bus %{y}<br>%{x}<br><b>%{z}</b> violation hours<extra></extra>",
         colorbar=dict(title="hr", thickness=10, len=0.78, x=1.04,
@@ -496,7 +533,7 @@ def top_buses_bar(weekly_df: pd.DataFrame, n: int = 10) -> go.Figure:
         y=[f"Bus {b}" for b in sub["bus"]],
         orientation="h",
         marker=dict(color=sub["violation_hours_week"],
-                    colorscale=[[0, "#5A4327"], [0.5, "#C97244"], [1, "#B83838"]],
+                    colorscale=[[0, "#E2B062"], [0.5, "#C97244"], [1, "#9C2828"]],
                     showscale=False),
         text=[f"{int(v)} hr · worst {w:.3f} pu" for v, w in
               zip(sub["violation_hours_week"], sub["worst_v_pu"])],
@@ -581,6 +618,7 @@ st.markdown(
     html, body, [data-testid="stAppViewContainer"] {{
         font-family: -apple-system, "Inter", system-ui, "Helvetica Neue", Arial, sans-serif;
         font-feature-settings: "tnum" 1, "ss01" 1;
+        background: #FFFFFF;
     }}
     .block-container {{
         padding-top: 1.6rem !important;
@@ -590,11 +628,12 @@ st.markdown(
     h1, h2, h3, h4 {{
         font-weight: 600 !important;
         letter-spacing: -0.005em;
+        color: {COLOR['text']};
     }}
     h2 {{ font-size: 1.55rem !important; margin-top: 1.4rem !important; margin-bottom: 0.6rem !important; }}
     h3 {{ font-size: 1.2rem !important; margin-top: 1.2rem !important; margin-bottom: 0.5rem !important; color: {COLOR['text']}; }}
     .top-rule {{
-        height: 3px; background: {COLOR['accent']}; opacity: 0.85;
+        height: 3px; background: {COLOR['accent']}; opacity: 0.95;
         margin: 0 0 1.4rem 0; border-radius: 1px;
     }}
     .nav-bar {{
@@ -620,36 +659,39 @@ st.markdown(
         border-left: 3px solid {COLOR['accent']};
     }}
     div[data-testid="stMetricLabel"] {{
-        font-size: 0.72rem !important; opacity: 0.75;
+        font-size: 0.72rem !important; color: {COLOR['text_dim']};
         text-transform: uppercase; letter-spacing: 0.06em; font-weight: 500 !important;
     }}
     div[data-testid="stMetricValue"] {{
-        font-size: 1.85rem !important; font-weight: 600;
+        font-size: 1.85rem !important; font-weight: 600; color: {COLOR['text']};
         font-feature-settings: "tnum" 1;
     }}
     div[data-testid="stMetricDelta"] {{ font-size: 0.85rem !important; }}
     button[data-baseweb="tab"] {{
         font-size: 0.92rem !important; padding: 0.6rem 1.3rem !important;
-        font-weight: 500 !important;
+        font-weight: 500 !important; color: {COLOR['text_dim']};
+    }}
+    button[data-baseweb="tab"][aria-selected="true"] {{
+        color: {COLOR['text']} !important;
     }}
     .role-banner {{
-        background: {COLOR['bg_card']};
+        background: #EEF4FB;
         border-left: 3px solid {COLOR['baseline']};
         padding: 0.7rem 1rem;
         border-radius: 2px;
         margin: 0.4rem 0 1.0rem;
-        font-size: 0.85rem; color: {COLOR['text_dim']};
+        font-size: 0.85rem; color: {COLOR['text']};
     }}
     .role-banner-planner {{
-        background: {COLOR['bg_card']};
-        border-left: 3px solid #8C7FB3;
+        background: #F1EEFB;
+        border-left: 3px solid #6E5BB0;
         padding: 0.7rem 1rem;
         border-radius: 2px;
         margin: 0.4rem 0 1.0rem;
-        font-size: 0.85rem; color: {COLOR['text_dim']};
+        font-size: 0.85rem; color: {COLOR['text']};
     }}
     .scenario-banner {{
-        background: rgba(232, 163, 23, 0.06);
+        background: #FAF1DD;
         border-left: 3px solid {COLOR['accent']};
         padding: 0.65rem 1rem;
         border-radius: 2px;
@@ -657,7 +699,7 @@ st.markdown(
         font-size: 0.85rem; color: {COLOR['text']};
     }}
     .priority-card {{
-        background: {COLOR['bg_card']};
+        background: #FCF3EC;
         border: 1px solid {COLOR['border']};
         border-left: 3px solid {COLOR['stress']};
         padding: 1.1rem 1.3rem;
@@ -665,7 +707,7 @@ st.markdown(
         margin-bottom: 1rem;
     }}
     .priority-card-ok {{
-        background: {COLOR['bg_card']};
+        background: #ECF7F1;
         border: 1px solid {COLOR['border']};
         border-left: 3px solid {COLOR['ok']};
         padding: 1.1rem 1.3rem;
@@ -692,6 +734,19 @@ st.markdown(
     }}
     a {{ color: {COLOR['accent']}; }}
     .stRadio > div {{ gap: 0.4rem; }}
+    /* Filter popover button — make the trigger compact and icon-style. */
+    button[data-testid="stPopoverButton"] {{
+        background: #FFFFFF !important;
+        border: 1px solid {COLOR['border']} !important;
+        color: {COLOR['text']} !important;
+        font-size: 0.82rem !important;
+        padding: 4px 12px !important;
+        border-radius: 3px !important;
+    }}
+    button[data-testid="stPopoverButton"]:hover {{
+        border-color: {COLOR['accent']} !important;
+        color: {COLOR['accent']} !important;
+    }}
     </style>
     """,
     unsafe_allow_html=True,
@@ -912,7 +967,8 @@ def render_operator_view():
         worst_v_stress = min(voltages_per_hour_stress[map_hour].values()) if voltages_per_hour_stress[map_hour] else float("nan")
 
         def _v_label(v):
-            return f"<span style='color:{COLOR['alert'] if v < 0.95 else COLOR['ok']};'><b>{v:.3f} pu</b></span>"
+            color = COLOR['alert'] if (v < 0.95 or v > 1.05) else COLOR['ok']
+            return f"<span style='color:{color};'><b>{v:.3f} pu</b></span>"
 
         if compare_view:
             mc1, mc2 = st.columns(2)
