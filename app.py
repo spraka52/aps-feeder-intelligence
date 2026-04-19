@@ -149,27 +149,6 @@ def _hosting_capacity(bus_order: tuple, nominal_items: tuple) -> dict:
     return run_hosting_capacity_subprocess(list(bus_order), nominal)
 
 
-# Reference EV penetration in our two synthesized datasets (used to interpolate
-# arbitrary EV adoption percentages without retraining the forecaster).
-EV_PCT_BASE = 0.0
-EV_PCT_STRESS = 35.0
-
-
-def interpolate_loads(base_kw: np.ndarray, stress_kw: np.ndarray,
-                      target_ev_pct: float) -> np.ndarray:
-    """Linearly interpolate between baseline (0% EV) and stress (35% EV) to
-    approximate an arbitrary EV adoption percentage.
-
-    For target_ev_pct = 0   → returns baseline
-    For target_ev_pct = 35  → returns stress
-    For target_ev_pct = 50  → extrapolates beyond stress (scale = 50/35)
-    Output is clipped to non-negative.
-    """
-    scale = float(target_ev_pct) / EV_PCT_STRESS
-    out = base_kw + scale * (stress_kw - base_kw)
-    return np.clip(out, 0.0, None).astype(np.float32)
-
-
 def _to_hour_results(dicts: List[dict]):
     from physics.opendss_runner import HourResult
     return [HourResult(**d) for d in dicts]
@@ -180,16 +159,30 @@ def _file_signature(p: Path) -> Tuple[float, int]:
     return (s.st_mtime, s.st_size)
 
 
-@st.cache_data(show_spinner="Computing weekly aggregate…")
+@st.cache_data(show_spinner="Computing OpenDSS solve across the date range…")
 def _solve_week_truth(week_kw_bytes: bytes, bus_order: tuple, day_shape: tuple,
                       week_label: str) -> List[List[dict]]:
+    """Solve N days × 24 hours of OpenDSS in ONE subprocess call.
+
+    Previously: one subprocess per day. For 7 days that's 7 startups
+    (~1-2 s each) + 7 actual solves. Now: one subprocess that runs the
+    full T-hour QSTS pass; OpenDSS's daily mode handles arbitrary T.
+    Result is re-chunked back into per-day lists so all the downstream
+    aggregation code (heatmap, weekly violations, action plan) is unchanged.
+
+    Bonus: regulators and capacitors now evolve continuously across day
+    boundaries instead of resetting at midnight — closer to physical reality.
+    """
     from physics.opendss_runner import _hourresult_to_dict
     week_kw = np.frombuffer(week_kw_bytes, dtype=np.float32).reshape(day_shape)
+    n_days, hours_per_day, n_buses = week_kw.shape
+    flat = week_kw.reshape(n_days * hours_per_day, n_buses)
+    flat_results = run_forecast_horizon(flat, list(bus_order))
+    # Re-chunk into per-day lists matching the original API
     out: List[List[dict]] = []
-    for d in range(week_kw.shape[0]):
-        day_loads = week_kw[d]
-        day_results = run_forecast_horizon(day_loads, list(bus_order))
-        out.append([_hourresult_to_dict(r) for r in day_results])
+    for d in range(n_days):
+        day_chunk = flat_results[d * hours_per_day : (d + 1) * hours_per_day]
+        out.append([_hourresult_to_dict(r) for r in day_chunk])
     return out
 
 
@@ -1750,9 +1743,12 @@ def render_planner_view():
     min_date = available_dates[0]
     max_date = available_dates[-1]
     # Default to a one-week window starting from a known heatwave preset
+    # Default to a 3-day window — small enough to compute fast (~3-4 sec),
+    # big enough to see at least one heatwave evening pattern. Planners can
+    # extend the To date for deeper capital-planning analyses.
     default_from = available_dates[max(0, len(available_dates) // 4)]
     default_to = available_dates[min(len(available_dates) - 1,
-                                     available_dates.index(default_from) + 6)]
+                                     available_dates.index(default_from) + 2)]
 
     cw1, cw2 = st.columns([1, 1])
     with cw1:
