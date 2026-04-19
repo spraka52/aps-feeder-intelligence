@@ -186,6 +186,12 @@ def build_planner_actions(
             # Overvoltage: PV-backfeed symptom → Volt-VAR + smart inverter coordination
             size_kvar = 50.0 + 3.0 * nominal
             cost = size_kvar * 100.0  # reactive-support cost
+            # Overvoltage payback: avoided PV curtailment. When inverters trip on
+            # overvoltage, ~50 kW of generation per cluster is curtailed. Recover
+            # that at ~$0.08/kWh wholesale-equivalent.
+            avoided_kwh = hours_year * 50.0
+            avoided_usd = avoided_kwh * 0.08
+            payback = cost / max(avoided_usd, 1.0)
             actions.append(PlannerAction(
                 priority=0,
                 bus=bus,
@@ -201,7 +207,7 @@ def build_planner_actions(
                     f"worst {worst:.3f} pu) — consistent with midday PV backfeed. "
                     f"Enrol inverters in Volt-VAR curtailment; consider fixed-cap bank switching schedule."
                 ),
-                payback_years=None,  # overvoltage prevention ROI is harder to dollar-ize
+                payback_years=payback if payback < 100 else None,
             ))
 
     # If the violations list is small, add the largest non-violating buses as

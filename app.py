@@ -248,6 +248,57 @@ def status_pill(label: str, kind: str = "ok") -> str:
     )
 
 
+# Streamlit's st.dataframe doesn't expose a reliable horizontal-scroll knob —
+# wide tables get squeezed and long descriptions get truncated mid-cell. Render
+# as a real HTML <table> wrapped in an overflow:auto div so users get both
+# horizontal AND vertical scroll, plus full text in every cell.
+def scrollable_table(df: pd.DataFrame, max_height: int = 460):
+    if df.empty:
+        return
+    df_safe = df.copy()
+    for col in df_safe.columns:
+        df_safe[col] = df_safe[col].astype(str)
+    html = df_safe.to_html(index=False, classes="aps-table", border=0, escape=True)
+    html = html.replace("<thead>", "<thead class='aps-thead'>")
+    css = f"""
+    <style>
+    .aps-scroll {{
+      overflow-x: auto; overflow-y: auto;
+      max-height: {max_height}px;
+      border: 1px solid {COLOR['border']};
+      border-radius: 4px;
+      background: rgba(20, 24, 32, 0.30);
+    }}
+    .aps-table {{
+      width: max-content; min-width: 100%;
+      border-collapse: collapse;
+      font-family: -apple-system, system-ui, "Inter", Helvetica, Arial, sans-serif;
+      font-size: 0.86rem;
+      font-feature-settings: "tnum" 1;
+      color: {COLOR['text']};
+    }}
+    .aps-table th, .aps-table td {{
+      padding: 8px 14px;
+      border-bottom: 1px solid rgba(180,190,200,0.10);
+      text-align: left;
+      white-space: nowrap;
+      vertical-align: top;
+    }}
+    .aps-thead th {{
+      background: rgba(70,80,100,0.28);
+      color: {COLOR['text_dim']};
+      font-weight: 500;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      font-size: 0.72rem;
+      position: sticky; top: 0; z-index: 2;
+    }}
+    .aps-table tr:hover td {{ background: rgba(255,255,255,0.04); }}
+    </style>
+    """
+    st.markdown(css + f'<div class="aps-scroll">{html}</div>', unsafe_allow_html=True)
+
+
 # --- Plotly defaults ------------------------------------------------------ #
 
 PLOTLY_LAYOUT_BASE = dict(
@@ -345,9 +396,11 @@ def violation_heatmap(mat_df: pd.DataFrame, dates) -> go.Figure:
     if not top_buses:
         top_buses = mat_df.index.tolist()[:20]
     sub = mat_df.loc[top_buses]
+    # Compact "Mon Jun 03" labels — short enough to lay flat without overlap.
+    x_labels = [d.strftime("%a %-m/%-d") for d in dates]
     fig = go.Figure(data=go.Heatmap(
         z=sub.values,
-        x=[d.strftime("%a %b %d") for d in dates],
+        x=x_labels,
         y=[f"Bus {b}" for b in sub.index],
         colorscale=[[0, "#1F2630"], [0.01, "#2C3340"], [0.3, "#D4A03A"], [0.6, "#C97244"], [1, "#B83838"]],
         zmin=0, zmax=max(1, int(sub.values.max())),
@@ -356,15 +409,15 @@ def violation_heatmap(mat_df: pd.DataFrame, dates) -> go.Figure:
                       tickfont=dict(size=10, color=COLOR["text_dim"])),
     ))
     layout = _layout("BUS × DAY · VOLTAGE-VIOLATION HOURS", height=540)
-    # Title sits *above* the chart, x-axis dates sit *inside* on top edge.
-    # We need a tall top margin so the dates don't bleed into the title row.
+    # Title sits above the chart row; tall top margin so the date labels at the
+    # top of the heatmap don't bleed into the title.
     layout["margin"] = dict(l=110, r=110, t=110, b=30)
     layout["title"] = dict(text="BUS × DAY · VOLTAGE-VIOLATION HOURS",
                            font=dict(size=12, color=COLOR["text_dim"]),
                            x=0.0, xanchor="left", y=0.985, yanchor="top")
     layout["xaxis"] = dict(side="top", tickfont=dict(size=10),
                            gridcolor="rgba(0,0,0,0)", automargin=True,
-                           tickangle=-30)
+                           tickangle=0)
     layout["yaxis"] = dict(tickfont=dict(size=10),
                            gridcolor="rgba(0,0,0,0)", automargin=True)
     layout["legend"] = dict()
@@ -854,13 +907,13 @@ def render_operator_view():
             rows.append({
                 "Hour": t.strftime("%a %b %d · %H:%M"),
                 "Status": status,
-                "V_violations": n_v,
-                "Thermal_overloads": n_t,
+                "V violations": n_v,
+                "Thermal overloads": n_t,
                 "Worst V (pu)": f"{worst_pu:.3f}",
                 "Total kW": f"{fcst_stress[h].sum():.0f}",
                 "Recommended action": hour_action,
             })
-        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True, height=720)
+        scrollable_table(pd.DataFrame(rows), max_height=620)
 
     with tab_actions:
         show_n = st.slider("Top N actions", 3, 15, 8)
@@ -872,31 +925,21 @@ def render_operator_view():
                 st.success(f"No violations in the {label} forecast.")
                 return
             df["kind"] = df["kind"].apply(fmt_kind)
+            # Pre-format numeric columns so they render cleanly in the HTML table.
+            df["severity"] = df["severity"].map(lambda x: f"{float(x):.2f}")
+            df["target_kw"] = df["target_kw"].map(
+                lambda x: f"{float(x):.0f}" if pd.notna(x) and x else "—")
+            df["when"] = pd.to_datetime(df["when"]).dt.strftime("%a %b %d · %H:%M")
             df_disp = df.rename(columns={
                 "priority": "Pri.", "kind": "Kind", "bus_or_line": "Bus / line",
                 "when": "Worst hour", "hours_affected": "Hrs",
                 "severity": "Severity", "target_kw": "Sized kW",
                 "detail": "Description", "recommendation": "Recommended action",
             })
-            # Height grows with row count so the scroll area is generous, capped
-            # so the table never pushes the page off-screen.
-            row_h = 38
-            table_h = min(640, max(220, row_h * (len(df_disp) + 1) + 8))
-            st.dataframe(
+            scrollable_table(
                 df_disp[["Pri.", "Kind", "Bus / line", "Worst hour", "Hrs",
                          "Severity", "Sized kW", "Description", "Recommended action"]],
-                width="stretch", hide_index=True, height=table_h,
-                column_config={
-                    "Pri.": st.column_config.NumberColumn(width="small"),
-                    "Kind": st.column_config.TextColumn(width="small"),
-                    "Bus / line": st.column_config.TextColumn(width="small"),
-                    "Worst hour": st.column_config.TextColumn(width="small"),
-                    "Hrs": st.column_config.NumberColumn(width="small"),
-                    "Severity": st.column_config.NumberColumn(format="%.2f", width="small"),
-                    "Sized kW": st.column_config.NumberColumn(format="%.0f", width="small"),
-                    "Description": st.column_config.TextColumn(width="medium"),
-                    "Recommended action": st.column_config.TextColumn(width="large"),
-                },
+                max_height=520,
             )
 
         with sub_stress:
@@ -954,7 +997,7 @@ def render_planner_view():
         return
 
     week_labels = [f"Week of {ws.strftime('%a %b %d, %Y')}" for ws, _ in weeks]
-    cw1, cw2, cw3 = st.columns([3, 2, 2])
+    cw1, cw2 = st.columns([3, 2])
     with cw1:
         pick_week_label = st.selectbox("Week to analyse", week_labels, index=min(2, len(week_labels) - 1))
     with cw2:
@@ -962,9 +1005,6 @@ def render_planner_view():
             "Scenario", ["Baseline", "Stress · heat + EV"],
             index=1, horizontal=True,
         )
-    with cw3:
-        view_mode = st.radio("Aggregate by", ["Per-day", "Per-hour-of-week"],
-                             index=0, horizontal=True)
 
     week_idx = week_labels.index(pick_week_label)
     ws, we = weeks[week_idx]
@@ -1037,36 +1077,24 @@ def render_planner_view():
     ])
 
     with tab_hm:
-        if view_mode == "Per-day":
-            day_dates = pd.date_range(ws, periods=n_days, freq="D")
-            st.plotly_chart(violation_heatmap(hours_matrix, day_dates), width="stretch")
-        else:
-            big = np.zeros((len(bus_order), n_days * 24), dtype=int)
-            bus_idx = {b: i for i, b in enumerate(bus_order)}
-            for d, day_results in enumerate(per_day_results):
-                for h, hr in enumerate(day_results):
-                    if not hr.converged:
-                        continue
-                    for b, v in hr.bus_voltage_pu.items():
-                        if v is None:
-                            continue
-                        if v < 0.95 or v > 1.05:
-                            big[bus_idx.get(b, 0), d * 24 + h] += 1
-            big_df = pd.DataFrame(big, index=list(bus_order),
-                                  columns=[f"D{d+1}H{h:02d}" for d in range(n_days) for h in range(24)])
-            big_dates = pd.date_range(ws, periods=n_days * 24, freq="h")
-            st.plotly_chart(violation_heatmap(big_df, big_dates), width="stretch")
+        day_dates = pd.date_range(ws, periods=n_days, freq="D")
+        st.plotly_chart(violation_heatmap(hours_matrix, day_dates), width="stretch")
+        st.caption(
+            "Daily voltage-violation hours per bus across the selected week. "
+            "Top 20 most-stressed buses shown — empty cells mean the bus was inside the "
+            "[0.95, 1.05] pu band that day."
+        )
 
     with tab_top:
         st.plotly_chart(top_buses_bar(weekly_df, n=10), width="stretch")
         with st.expander("Per-bus weekly stats (full table)"):
-            st.dataframe(
-                weekly_df.rename(columns={
-                    "bus": "Bus", "violation_hours_week": "Violation hr/wk",
-                    "worst_v_pu": "Worst V (pu)", "days_with_violation": "Days affected",
-                }),
-                width="stretch", hide_index=True, height=420,
-            )
+            stats_df = weekly_df.copy()
+            stats_df["worst_v_pu"] = stats_df["worst_v_pu"].map(lambda x: f"{x:.3f} pu")
+            stats_df = stats_df.rename(columns={
+                "bus": "Bus", "violation_hours_week": "Violation hr/wk",
+                "worst_v_pu": "Worst V (pu)", "days_with_violation": "Days affected",
+            })
+            scrollable_table(stats_df, max_height=420)
 
     with tab_trend:
         st.plotly_chart(weekly_trend_chart(trend_df), width="stretch")
@@ -1078,9 +1106,35 @@ def render_planner_view():
     with tab_capex:
         st.caption(
             "Capital projects ranked by annualised violation hours × severity. "
-            "Cost and payback are order-of-magnitude estimates: $1,500/kW for "
-            "battery; avoided customer-minute valued at $0.15/min × 20 customers/bus."
+            "Cost and payback are order-of-magnitude planning estimates — useful for "
+            "deciding *where* to invest, not for procurement."
         )
+        with st.expander("How are cost and payback calculated?"):
+            st.markdown(
+                """
+                **Sizing**
+                - **Battery (undervoltage)** kW = `clip(20 × (0.95 − worst_pu)/0.01 × nominal/100 × 5, 25, 2000)`
+                  — closes the voltage-sag gap with real-power injection.
+                - **Volt-VAR program (overvoltage)** kVAr = `50 + 3 × bus_nominal_kw`
+                  — reactive support to absorb PV backfeed.
+
+                **Cost (capex, order-of-magnitude 2024 USD)**
+                - Battery: **$1,500 / kW** installed (inverter + civil + commissioning).
+                - Volt-VAR: **$100 / kVAr** of reactive support.
+
+                **Annualised violation hours**
+                `hours_year = hours_this_week × 13 weeks × 3 seasons / 3`
+                — projects this week onto a 13-summer-week season, repeated for ~3 stress seasons/yr.
+
+                **Payback (years)** = `cost / annual_avoided_value`
+                - **Battery**: avoided value = `hours_year × 60 min × 20 customers/bus × $0.15/min`
+                  (CAIDI proxy: $0.15 per customer-minute of avoided outage).
+                - **Volt-VAR**: avoided value = `hours_year × 50 kW curtailed × $0.08/kWh`
+                  (recovered PV revenue at wholesale).
+                - **Monitor / watch-list** entries have no investment, so payback is *n/a* by design.
+                - Payback above 100 years is shown as *n/a* — beyond planning horizon.
+                """
+            )
         if not plan_actions:
             st.success("No capital projects warranted this week — feeder is operating within limits.")
         else:
@@ -1099,17 +1153,19 @@ def render_planner_view():
                 "rationale": "Rationale",
                 "payback_years": "Payback (yr)",
             })
-            df_disp["Cost (USD)"] = df_disp["Cost (USD)"].map(lambda x: f"${x:,.0f}")
+            df_disp["Cost (USD)"] = df_disp["Cost (USD)"].map(
+                lambda x: f"${x:,.0f}" if x and x > 0 else "—")
             df_disp["Hr/yr (annualized)"] = df_disp["Hr/yr (annualized)"].map(lambda x: f"{x:.0f}")
-            df_disp["Size (kW)"] = df_disp["Size (kW)"].map(lambda x: f"{x:.0f}")
+            df_disp["Size (kW)"] = df_disp["Size (kW)"].map(
+                lambda x: f"{x:.0f}" if x and x > 0 else "—")
             df_disp["Worst V"] = df_disp["Worst V"].map(lambda x: f"{x:.3f} pu")
             df_disp["Payback (yr)"] = df_disp["Payback (yr)"].map(
                 lambda x: f"{x:.1f}" if pd.notna(x) else "n/a")
-            st.dataframe(
+            scrollable_table(
                 df_disp[["Pri.", "Bus", "Project type", "Size (kW)", "Cost (USD)",
                          "Hr/wk now", "Hr/yr (annualized)", "Worst V",
                          "Days affected", "Payback (yr)", "Rationale"]],
-                width="stretch", hide_index=True, height=420,
+                max_height=460,
             )
 
 
