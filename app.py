@@ -35,10 +35,11 @@ STRESS_NPZ = REPO / "data" / "synthetic" / "stress_ev35_pv8.npz"
 
 
 # -----------------------------------------------------------------------------
-# Theme palettes — light (default) + dark, switchable via the header toggle.
-# Inspired by SCADA / EMS dashboards: narrow accent palette, data over chrome.
+# Light, utility-control-center palette.
+# Inspired by SCADA / EMS dashboards: clean white background, slate text,
+# narrow accent palette, data takes precedence over chrome.
 # -----------------------------------------------------------------------------
-LIGHT_PALETTE = {
+COLOR = {
     "accent":     "#C77F00",   # APS gold (deeper for light-bg contrast)
     "accent_dim": "#A26800",
     "baseline":   "#2F66A3",   # deeper blue for light bg
@@ -57,35 +58,6 @@ LIGHT_PALETTE = {
     "web_stroke": "rgba(199, 127, 0, 0.10)",   # APS-gold spider-web lines
     "web_node":   "rgba(199, 127, 0, 0.18)",
 }
-
-DARK_PALETTE = {
-    "accent":     "#FFC72C",   # APS gold pops on dark
-    "accent_dim": "#B07A0F",
-    "baseline":   "#7AB0E2",
-    "stress":     "#F09060",
-    "ok":         "#5BC48C",
-    "warn":       "#E2B560",
-    "alert":      "#E26060",
-    "neutral":    "#9AA1AC",
-    "text":       "#E8ECEF",
-    "text_dim":   "#A0A8B2",
-    "bg_card":    "#1B2230",
-    "bg_panel":   "#0F141B",
-    "bg_page":    "#0A0E14",
-    "border":     "rgba(255, 199, 44, 0.18)",
-    "grid":       "rgba(255, 255, 255, 0.07)",
-    "web_stroke": "rgba(255, 199, 44, 0.14)",
-    "web_node":   "rgba(255, 199, 44, 0.25)",
-}
-
-
-def get_palette(dark: bool) -> dict:
-    return DARK_PALETTE if dark else LIGHT_PALETTE
-
-
-# Module-level COLOR is reassigned at render-time based on the toggle so the
-# rest of the codebase can keep using `COLOR['accent']` etc. unchanged.
-COLOR = LIGHT_PALETTE
 
 
 # --- Caching --------------------------------------------------------------- #
@@ -239,17 +211,10 @@ def feeder_map_deck(
         col = "bus_or_line" if "bus_or_line" in actions_df.columns else "bus"
         flagged = set(actions_df[col].astype(str).tolist())
 
-    # Theme-aware label / outline colors so they stay readable on either bg
-    if DARK:
-        label_color   = [232, 235, 240, 255]
-        label_bg      = [22, 28, 38, 230]
-        node_outline  = [240, 245, 250, 230]
-        sub_halo      = [255, 199, 44, 235]
-    else:
-        label_color   = [22, 28, 38, 255]
-        label_bg      = [255, 255, 255, 235]
-        node_outline  = [40, 50, 65, 240]
-        sub_halo      = [199, 127, 0, 235]
+    label_color   = [22, 28, 38, 255]
+    label_bg      = [255, 255, 255, 235]
+    node_outline  = [40, 50, 65, 240]
+    sub_halo      = [199, 127, 0, 235]
 
     nodes, halo_outer, halo_mid, halo_inner, labels, sub_nodes = [], [], [], [], [], []
     for b in fg.g.nodes():
@@ -294,12 +259,10 @@ def feeder_map_deck(
             cfg = data.get("config", "")
             if cfg in ("300", "301"):
                 # Trunk lines — heavier, accent color
-                col = [199, 127, 0, 220] if not DARK else [255, 199, 44, 220]
-                edges_main.append({"path": path, "color": col, "width": 5})
+                edges_main.append({"path": path, "color": [199, 127, 0, 220], "width": 5})
             else:
                 # Lateral lines — lighter, neutral
-                col = [120, 130, 145, 200] if not DARK else [180, 188, 200, 200]
-                edges_lat.append({"path": path, "color": col, "width": 3})
+                edges_lat.append({"path": path, "color": [120, 130, 145, 200], "width": 3})
 
     lats = [c[0] for c in COORDS.values()]
     lons = [c[1] for c in COORDS.values()]
@@ -354,19 +317,15 @@ def feeder_map_deck(
                   get_background_color=label_bg),
     ]
 
-    tooltip_bg = "#0F141B" if DARK else "#FFFFFF"
-    tooltip_fg = "#E8ECEF" if DARK else "#1A1F2B"
-    tooltip_border = "#FFC72C" if DARK else "#C77F00"
-
     return pdk.Deck(
         layers=layers,
         initial_view_state=view,
-        map_style="dark" if DARK else "light",
+        map_style="light",
         tooltip={
             "html": "<b>Bus {bus}</b><br/>Voltage: <b>{v_label}</b><br/>Nominal load: {nominal_kw:.0f} kW",
-            "style": {"backgroundColor": tooltip_bg, "color": tooltip_fg,
+            "style": {"backgroundColor": "#FFFFFF", "color": "#1A1F2B",
                       "fontSize": "12px",
-                      "border": f"1px solid {tooltip_border}",
+                      "border": "1px solid #C77F00",
                       "borderRadius": "4px", "padding": "8px 12px",
                       "boxShadow": "0 4px 14px rgba(0,0,0,0.20)"},
         },
@@ -424,13 +383,12 @@ def scrollable_table(df: pd.DataFrame, max_height: int = 460):
     table_html = df_safe.to_html(index=False, classes="aps-table",
                                  border=0, escape=True)
     table_html = table_html.replace("<thead>", "<thead class='aps-thead'>")
-    # Theme-aware colors
     page_bg     = COLOR["bg_panel"]
     head_bg     = COLOR["bg_card"]
-    row_alt     = "rgba(255,255,255,0.025)" if DARK else "#FCFCFD"
-    row_hover   = "rgba(255,199,44,0.06)"   if DARK else "#FAFBFC"
-    cell_border = "rgba(255,255,255,0.07)"  if DARK else "rgba(20, 30, 50, 0.08)"
-    scroll_thumb = "rgba(255,199,44,0.30)"  if DARK else "rgba(20, 30, 50, 0.20)"
+    row_alt     = "#FCFCFD"
+    row_hover   = "#FAFBFC"
+    cell_border = "rgba(20, 30, 50, 0.08)"
+    scroll_thumb = "rgba(20, 30, 50, 0.20)"
 
     full_html = f"""
     <!doctype html>
@@ -564,28 +522,30 @@ def column_picker(
 
 # --- Plotly defaults ------------------------------------------------------ #
 
-def _plotly_base() -> dict:
-    """Theme-aware Plotly layout base — re-read COLOR each call so dark/light
-    toggle flips chart text + grid colors live."""
-    plot_bg = "rgba(244, 246, 248, 0.55)" if COLOR is LIGHT_PALETTE else "rgba(20, 30, 50, 0.35)"
-    return dict(
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor=plot_bg,
-        font=dict(family="-apple-system, system-ui, Helvetica, Arial, sans-serif",
-                  size=12, color=COLOR["text"]),
-        margin=dict(l=12, r=12, t=44, b=44),
-        xaxis=dict(gridcolor=COLOR["grid"], zeroline=False, ticks="outside",
-                   linecolor=COLOR["border"], tickcolor=COLOR["border"]),
-        yaxis=dict(gridcolor=COLOR["grid"], zeroline=False, ticks="outside",
-                   linecolor=COLOR["border"], tickcolor=COLOR["border"]),
-        legend=dict(orientation="h", yanchor="bottom", y=-0.32, xanchor="center", x=0.5,
-                    bgcolor="rgba(0,0,0,0)", font=dict(size=11, color=COLOR["text"]),
-                    itemsizing="constant"),
-    )
+PLOTLY_LAYOUT_BASE = dict(
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(244, 246, 248, 0.55)",
+    font=dict(family="-apple-system, system-ui, Helvetica, Arial, sans-serif",
+              size=12, color=COLOR["text"]),
+    margin=dict(l=12, r=12, t=44, b=44),
+    xaxis=dict(gridcolor=COLOR["grid"], zeroline=False, ticks="outside",
+               linecolor=COLOR["border"], tickcolor=COLOR["border"]),
+    yaxis=dict(gridcolor=COLOR["grid"], zeroline=False, ticks="outside",
+               linecolor=COLOR["border"], tickcolor=COLOR["border"]),
+    legend=dict(orientation="h", yanchor="bottom", y=-0.32, xanchor="center", x=0.5,
+                bgcolor="rgba(0,0,0,0)", font=dict(size=11, color=COLOR["text"]),
+                itemsizing="constant"),
+)
 
 
 def _layout(title: str, **overrides) -> dict:
-    base = _plotly_base()
+    base = json.loads(json.dumps(PLOTLY_LAYOUT_BASE, default=str))
+    # Restore non-serialisable bits
+    base["xaxis"] = PLOTLY_LAYOUT_BASE["xaxis"]
+    base["yaxis"] = PLOTLY_LAYOUT_BASE["yaxis"]
+    base["font"] = PLOTLY_LAYOUT_BASE["font"]
+    base["legend"] = PLOTLY_LAYOUT_BASE["legend"]
+    base["margin"] = PLOTLY_LAYOUT_BASE["margin"]
     base["title"] = dict(text=title.upper(),
                          font=dict(size=12, color=COLOR["text_dim"]),
                          x=0.0, xanchor="left", y=0.97)
@@ -889,18 +849,10 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# --- Theme toggle: dark / light --------------------------------------------- #
-if "dark_mode" not in st.session_state:
-    st.session_state.dark_mode = False
-
-# Toggle is wired into the header row below — read its session-state value here
-# so the rest of the module sees the right COLOR palette.
-DARK = bool(st.session_state.dark_mode)
-COLOR = get_palette(DARK)
 
 # Restrained, utility-grade CSS. Neutral typography, sober spacing,
 # narrow accent palette.
-_WEB_SVG_LIGHT = (
+_web_svg = (
     "data:image/svg+xml;utf8,"
     "<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'>"
     "<defs><pattern id='p' width='160' height='160' patternUnits='userSpaceOnUse'>"
@@ -915,24 +867,7 @@ _WEB_SVG_LIGHT = (
     "<rect width='100%25' height='100%25' fill='url(%23p)'/>"
     "</svg>"
 )
-
-_WEB_SVG_DARK = (
-    "data:image/svg+xml;utf8,"
-    "<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'>"
-    "<defs><pattern id='p' width='160' height='160' patternUnits='userSpaceOnUse'>"
-    "<path d='M80 0 L80 160 M0 80 L160 80 M0 0 L160 160 M160 0 L0 160' "
-    "stroke='rgba(255,199,44,0.14)' stroke-width='0.7' fill='none'/>"
-    "<circle cx='80' cy='80' r='2.2' fill='rgba(255,199,44,0.30)'/>"
-    "<circle cx='0' cy='0' r='1.6' fill='rgba(255,199,44,0.22)'/>"
-    "<circle cx='160' cy='0' r='1.6' fill='rgba(255,199,44,0.22)'/>"
-    "<circle cx='0' cy='160' r='1.6' fill='rgba(255,199,44,0.22)'/>"
-    "<circle cx='160' cy='160' r='1.6' fill='rgba(255,199,44,0.22)'/>"
-    "</pattern></defs>"
-    "<rect width='100%25' height='100%25' fill='url(%23p)'/>"
-    "</svg>"
-)
-_web_svg = _WEB_SVG_DARK if DARK else _WEB_SVG_LIGHT
-_glow_a = COLOR["baseline"] if not DARK else "#3FA3D6"
+_glow_a = COLOR["baseline"]
 _glow_b = COLOR["accent"]
 
 st.markdown(
@@ -1045,7 +980,7 @@ st.markdown(
         color: {COLOR['text']} !important;
     }}
     .role-banner {{
-        background: {("rgba(47, 102, 163, 0.10)" if DARK else "#EEF4FB")};
+        background: #EEF4FB;
         border-left: 3px solid {COLOR['baseline']};
         padding: 0.7rem 1rem;
         border-radius: 2px;
@@ -1054,7 +989,7 @@ st.markdown(
         backdrop-filter: blur(4px);
     }}
     .role-banner-planner {{
-        background: {("rgba(110, 91, 176, 0.15)" if DARK else "#F1EEFB")};
+        background: #F1EEFB;
         border-left: 3px solid #8B79CC;
         padding: 0.7rem 1rem;
         border-radius: 2px;
@@ -1063,7 +998,7 @@ st.markdown(
         backdrop-filter: blur(4px);
     }}
     .scenario-banner {{
-        background: {("rgba(255, 199, 44, 0.10)" if DARK else "#FAF1DD")};
+        background: #FAF1DD;
         border-left: 3px solid {COLOR['accent']};
         padding: 0.65rem 1rem;
         border-radius: 2px;
@@ -1072,7 +1007,7 @@ st.markdown(
         backdrop-filter: blur(4px);
     }}
     .priority-card {{
-        background: {("rgba(240, 144, 96, 0.10)" if DARK else "#FCF3EC")};
+        background: #FCF3EC;
         border: 1px solid {COLOR['border']};
         border-left: 3px solid {COLOR['stress']};
         padding: 1.1rem 1.3rem;
@@ -1081,7 +1016,7 @@ st.markdown(
         backdrop-filter: blur(6px);
     }}
     .priority-card-ok {{
-        background: {("rgba(91, 196, 140, 0.10)" if DARK else "#ECF7F1")};
+        background: #ECF7F1;
         border: 1px solid {COLOR['border']};
         border-left: 3px solid {COLOR['ok']};
         padding: 1.1rem 1.3rem;
@@ -1131,7 +1066,7 @@ st.markdown(
 # --- Top header ---------------------------------------------------------- #
 
 st.markdown('<div class="top-rule"></div>', unsafe_allow_html=True)
-hdr_brand, hdr_tog, hdr_src = st.columns([8, 1.4, 1.2])
+hdr_brand, hdr_src = st.columns([9, 2])
 with hdr_brand:
     st.markdown(
         f"""
@@ -1144,13 +1079,6 @@ with hdr_brand:
         </div>
         """,
         unsafe_allow_html=True,
-    )
-with hdr_tog:
-    st.markdown("<div style='padding-top:0.5rem;'></div>", unsafe_allow_html=True)
-    st.session_state.dark_mode = st.toggle(
-        "Dark mode",
-        value=st.session_state.dark_mode,
-        help="Switch between light (utility-control-center) and dark (SCADA-night) themes.",
     )
 with hdr_src:
     st.markdown(
