@@ -321,6 +321,47 @@ def scrollable_table(df: pd.DataFrame, max_height: int = 460):
     components.html(full_html, height=max_height + 12, scrolling=False)
 
 
+def column_picker(
+    df: pd.DataFrame,
+    key: str,
+    default_cols: Optional[List[str]] = None,
+    essential_cols: Optional[List[str]] = None,
+    label: str = "Configure columns",
+) -> pd.DataFrame:
+    """Popover with a multiselect that lets the user choose visible columns.
+
+    `essential_cols` are always present even if the user un-checks them, so
+    the table never collapses to something unusable. Hidden state is keyed
+    by `key` so different tables don't share selections.
+    """
+    all_cols = list(df.columns)
+    if default_cols is None:
+        default_cols = all_cols
+    defaults = [c for c in default_cols if c in all_cols]
+    essential = [c for c in (essential_cols or []) if c in all_cols]
+
+    state_key = f"colpick_{key}"
+    chosen = st.session_state.get(state_key, defaults)
+
+    with st.popover(f"{label}  ·  {len(chosen)} / {len(all_cols)} shown"):
+        st.caption("Tick the columns you want visible. Essentials are kept "
+                   "regardless to keep the table readable.")
+        chosen = st.multiselect(
+            "Visible columns",
+            options=all_cols,
+            default=chosen,
+            key=state_key,
+            label_visibility="collapsed",
+        )
+        if essential:
+            st.caption(f"Always shown: {', '.join(essential)}")
+
+    final = [c for c in all_cols if c in chosen or c in essential]
+    if not final:
+        final = defaults
+    return df[final]
+
+
 # --- Plotly defaults ------------------------------------------------------ #
 
 PLOTLY_LAYOUT_BASE = dict(
@@ -935,13 +976,19 @@ def render_operator_view():
                 "Total kW": f"{fcst_stress[h].sum():.0f}",
                 "Recommended action": hour_action,
             })
-        scrollable_table(pd.DataFrame(rows), max_height=620)
+        timeline_df = pd.DataFrame(rows)
+        timeline_df = column_picker(
+            timeline_df, key="op_timeline",
+            default_cols=list(timeline_df.columns),
+            essential_cols=["Hour", "Status"],
+        )
+        scrollable_table(timeline_df, max_height=620)
 
     with tab_actions:
         show_n = st.slider("Top N actions", 3, 15, 8)
         sub_stress, sub_base = st.tabs(["Stress scenario", "Baseline scenario"])
 
-        def _render(actions_list, label):
+        def _render(actions_list, label, picker_key: str):
             df = ops_actions_to_df(actions_list).head(show_n)
             if df.empty:
                 st.success(f"No violations in the {label} forecast.")
@@ -958,16 +1005,20 @@ def render_operator_view():
                 "severity": "Severity", "target_kw": "Sized kW",
                 "detail": "Description", "recommendation": "Recommended action",
             })
-            scrollable_table(
-                df_disp[["Pri.", "Kind", "Bus / line", "Worst hour", "Hrs",
-                         "Severity", "Sized kW", "Description", "Recommended action"]],
-                max_height=520,
+            ordered = ["Pri.", "Kind", "Bus / line", "Worst hour", "Hrs",
+                       "Severity", "Sized kW", "Description", "Recommended action"]
+            df_disp = df_disp[ordered]
+            df_disp = column_picker(
+                df_disp, key=picker_key,
+                default_cols=ordered,
+                essential_cols=["Pri.", "Bus / line", "Recommended action"],
             )
+            scrollable_table(df_disp, max_height=520)
 
         with sub_stress:
-            _render(actions_stress, "stress")
+            _render(actions_stress, "stress", picker_key="op_actions_stress")
         with sub_base:
-            _render(actions_base, "baseline")
+            _render(actions_base, "baseline", picker_key="op_actions_base")
 
 
 # =============================================================================
@@ -1116,6 +1167,11 @@ def render_planner_view():
                 "bus": "Bus", "violation_hours_week": "Violation hr/wk",
                 "worst_v_pu": "Worst V (pu)", "days_with_violation": "Days affected",
             })
+            stats_df = column_picker(
+                stats_df, key="planner_perbus",
+                default_cols=list(stats_df.columns),
+                essential_cols=["Bus"],
+            )
             scrollable_table(stats_df, max_height=420)
 
     with tab_trend:
@@ -1183,12 +1239,16 @@ def render_planner_view():
             df_disp["Worst V"] = df_disp["Worst V"].map(lambda x: f"{x:.3f} pu")
             df_disp["Payback (yr)"] = df_disp["Payback (yr)"].map(
                 lambda x: f"{x:.1f}" if pd.notna(x) else "n/a")
-            scrollable_table(
-                df_disp[["Pri.", "Bus", "Project type", "Size (kW)", "Cost (USD)",
-                         "Hr/wk now", "Hr/yr (annualized)", "Worst V",
-                         "Days affected", "Payback (yr)", "Rationale"]],
-                max_height=460,
+            ordered = ["Pri.", "Bus", "Project type", "Size (kW)", "Cost (USD)",
+                       "Hr/wk now", "Hr/yr (annualized)", "Worst V",
+                       "Days affected", "Payback (yr)", "Rationale"]
+            df_capex = df_disp[ordered]
+            df_capex = column_picker(
+                df_capex, key="planner_capex",
+                default_cols=ordered,
+                essential_cols=["Pri.", "Bus", "Project type"],
             )
+            scrollable_table(df_capex, max_height=460)
 
 
 # Render
